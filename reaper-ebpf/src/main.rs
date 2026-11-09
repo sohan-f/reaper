@@ -2,7 +2,7 @@
 #![no_main]
 
 use aya_ebpf::{
-    helpers,
+    Global, helpers,
     macros::{btf_tracepoint, map},
     maps::{HashMap, LruHashMap, PerCpuArray, RingBuf},
     programs::BtfTracePointContext,
@@ -29,15 +29,15 @@ static DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 // Offsets are injected from device BTF before load; 0 means injection never ran.
 #[unsafe(no_mangle)]
-static OFF_TGID: u32 = 0;
+static OFF_TGID: Global<u32> = Global::new(0);
 #[unsafe(no_mangle)]
-static OFF_SIGNAL: u32 = 0;
+static OFF_SIGNAL: Global<u32> = Global::new(0);
 #[unsafe(no_mangle)]
-static OFF_REAL_CRED: u32 = 0;
+static OFF_REAL_CRED: Global<u32> = Global::new(0);
 #[unsafe(no_mangle)]
-static OFF_CRED_UID: u32 = 0;
+static OFF_CRED_UID: Global<u32> = Global::new(0);
 #[unsafe(no_mangle)]
-static OFF_SIG_OOM_ADJ: u32 = 0;
+static OFF_SIG_OOM_ADJ: Global<u32> = Global::new(0);
 
 #[btf_tracepoint(function = "oom_score_adj_update")]
 pub fn oom_score_adj_update(ctx: BtfTracePointContext) -> i32 {
@@ -51,10 +51,10 @@ fn try_run(ctx: &BtfTracePointContext) -> Result<(), i32> {
     // SAFETY: OFF_* are injected from the device BTF at load time and reads go
     // through bpf_probe_read_kernel, which cannot trap on a bad address.
     let signal: *const u8 = unsafe {
-        helpers::bpf_probe_read_kernel(task.add(OFF_SIGNAL as usize).cast::<*const u8>())?
+        helpers::bpf_probe_read_kernel(task.add(OFF_SIGNAL.load() as usize).cast::<*const u8>())?
     };
     let adj: i16 = unsafe {
-        helpers::bpf_probe_read_kernel(signal.add(OFF_SIG_OOM_ADJ as usize).cast::<i16>())?
+        helpers::bpf_probe_read_kernel(signal.add(OFF_SIG_OOM_ADJ.load() as usize).cast::<i16>())?
     };
 
     if adj <= 0 {
@@ -62,15 +62,17 @@ fn try_run(ctx: &BtfTracePointContext) -> Result<(), i32> {
     }
 
     // SAFETY: see above.
-    let tgid: u32 =
-        unsafe { helpers::bpf_probe_read_kernel(task.add(OFF_TGID as usize).cast::<u32>())? };
-    // SAFETY: see above.
-    let cred: *const u8 = unsafe {
-        helpers::bpf_probe_read_kernel(task.add(OFF_REAL_CRED as usize).cast::<*const u8>())?
+    let tgid: u32 = unsafe {
+        helpers::bpf_probe_read_kernel(task.add(OFF_TGID.load() as usize).cast::<u32>())?
     };
     // SAFETY: see above.
-    let uid: u32 =
-        unsafe { helpers::bpf_probe_read_kernel(cred.add(OFF_CRED_UID as usize).cast::<u32>())? };
+    let cred: *const u8 = unsafe {
+        helpers::bpf_probe_read_kernel(task.add(OFF_REAL_CRED.load() as usize).cast::<*const u8>())?
+    };
+    // SAFETY: see above.
+    let uid: u32 = unsafe {
+        helpers::bpf_probe_read_kernel(cred.add(OFF_CRED_UID.load() as usize).cast::<u32>())?
+    };
 
     let appid = uid % UIDS_PER_USER;
     if !(APPID_START..=APPID_END).contains(&appid) {
