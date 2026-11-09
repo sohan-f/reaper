@@ -1,6 +1,6 @@
 //! Package to uid resolution.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -12,6 +12,7 @@ use crate::policy::appid_of;
 pub struct UidMap {
     packages_by_appid: HashMap<u32, Vec<String>>,
     uid_by_package: HashMap<String, u32>,
+    user_ids: HashSet<u32>,
 }
 
 impl UidMap {
@@ -38,6 +39,13 @@ impl UidMap {
         self.uid_by_package.len()
     }
 
+    /// Returns the user ids present in the map, sorted.
+    pub fn users(&self) -> Vec<u32> {
+        let mut users: Vec<u32> = self.user_ids.iter().copied().collect();
+        users.sort_unstable();
+        users
+    }
+
     pub fn parse_packages_list(text: &str) -> Self {
         let mut map = Self::default();
         for line in text.lines() {
@@ -52,6 +60,7 @@ impl UidMap {
                 continue;
             };
             let Some(appid) = appid_of(uid) else { continue };
+            map.user_ids.insert(uid / 100_000);
             map.packages_by_appid
                 .entry(appid)
                 .or_default()
@@ -78,6 +87,7 @@ impl UidMap {
                 continue;
             };
             let Some(appid) = appid_of(uid) else { continue };
+            map.user_ids.insert(uid / 100_000);
             map.packages_by_appid
                 .entry(appid)
                 .or_default()
@@ -138,5 +148,12 @@ mod tests {
         let map = UidMap::parse_cmd_list(text);
         assert_eq!(map.uid_of("com.twitter.android"), Some(10381));
         assert_eq!(map.packages_of(10381), &["com.twitter.android".to_string()]);
+    }
+
+    #[test]
+    fn lists_users() {
+        let text = "com.example 10123 0 /data\ncom.example 1010123 0 /data\n";
+        let map = UidMap::parse_packages_list(text);
+        assert_eq!(map.users(), vec![0, 10]);
     }
 }

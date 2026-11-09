@@ -1,4 +1,4 @@
-//! Built-in never-kill packages, including the current launcher, IME, and dialer.
+//! Built-in never-kill packages, including each user's launcher, IME, and dialer.
 
 use std::{process::Command, time::Duration};
 
@@ -17,19 +17,22 @@ pub const PACKAGES: &[&str] = &[
     "com.android.server.telecom",
 ];
 
-pub fn resolve() -> Vec<String> {
+/// Returns the built-in never-kill set, including role holders for `users`.
+pub fn resolve(users: &[u32]) -> Vec<String> {
     let mut packages: Vec<String> = PACKAGES.iter().map(|package| package.to_string()).collect();
-    for (role, package) in [
-        ("launcher", resolve_launcher()),
-        ("ime", resolve_ime()),
-        ("dialer", resolve_dialer()),
-    ] {
-        match package {
-            Some(package) => {
-                info!("never_kill: {role} is {package}");
-                packages.push(package);
+    for &user in users {
+        for (role, package) in [
+            ("launcher", resolve_launcher(user)),
+            ("ime", resolve_ime(user)),
+            ("dialer", resolve_dialer(user)),
+        ] {
+            match package {
+                Some(package) => {
+                    info!("never_kill: user {user} {role} is {package}");
+                    packages.push(package);
+                }
+                None => warn!("never_kill: cannot resolve user {user} {role}"),
             }
-            None => warn!("never_kill: cannot resolve {role}"),
         }
     }
     packages.sort();
@@ -37,38 +40,48 @@ pub fn resolve() -> Vec<String> {
     packages
 }
 
-fn resolve_launcher() -> Option<String> {
-    resolve_component(&[
-        "package",
-        "resolve-activity",
-        "--brief",
-        "-a",
-        "android.intent.action.MAIN",
-        "-c",
-        "android.intent.category.HOME",
-    ])
+fn resolve_launcher(user: u32) -> Option<String> {
+    resolve_component(
+        user,
+        &[
+            "-a",
+            "android.intent.action.MAIN",
+            "-c",
+            "android.intent.category.HOME",
+        ],
+    )
 }
 
-fn resolve_dialer() -> Option<String> {
-    resolve_component(&[
-        "package",
-        "resolve-activity",
-        "--brief",
-        "-a",
-        "android.intent.action.DIAL",
-    ])
+fn resolve_dialer(user: u32) -> Option<String> {
+    resolve_component(user, &["-a", "android.intent.action.DIAL"])
 }
 
-fn resolve_ime() -> Option<String> {
+fn resolve_ime(user: u32) -> Option<String> {
+    let user = user.to_string();
     let output = run(
         "/system/bin/settings",
-        &["get", "secure", "default_input_method"],
+        &[
+            "--user",
+            user.as_str(),
+            "get",
+            "secure",
+            "default_input_method",
+        ],
     )?;
     package_from_component(&output)
 }
 
-fn resolve_component(args: &[&str]) -> Option<String> {
-    let output = run("/system/bin/cmd", args)?;
+fn resolve_component(user: u32, args: &[&str]) -> Option<String> {
+    let user = user.to_string();
+    let mut full_args = vec![
+        "package",
+        "resolve-activity",
+        "--brief",
+        "--user",
+        user.as_str(),
+    ];
+    full_args.extend_from_slice(args);
+    let output = run("/system/bin/cmd", &full_args)?;
     package_from_component(&output)
 }
 
@@ -108,5 +121,18 @@ mod tests {
         );
         assert_eq!(package_from_component("null\n"), None);
         assert_eq!(package_from_component(""), None);
+    }
+
+    #[test]
+    fn empty_users_returns_builtin_packages() {
+        let packages = resolve(&[]);
+        assert_eq!(packages.len(), PACKAGES.len());
+        for package in PACKAGES {
+            assert!(
+                packages
+                    .iter()
+                    .any(|resolved| resolved.as_str() == *package)
+            );
+        }
     }
 }

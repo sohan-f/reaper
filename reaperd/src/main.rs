@@ -567,7 +567,11 @@ fn run() -> anyhow::Result<()> {
         warn!("failed to build uid map: {err:#}");
         UidMap::empty()
     });
-    let builtin_never_kill = never_kill::resolve();
+    let mut users = uid_map.users();
+    if users.is_empty() {
+        users.push(0);
+    }
+    let builtin_never_kill = never_kill::resolve(&users);
     let deny = build_deny(&policy, &builtin_never_kill, &uid_map, &cfg.deny_overrides);
     let [deny_map_raw, ring_map] = bpf.maps_disjoint_mut(["DENY", "RING"]);
     let mut deny_map: DenyMapMut<'_> =
