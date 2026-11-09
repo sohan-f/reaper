@@ -1,8 +1,12 @@
 //! Built-in never-kill packages, including the current launcher, IME, and dialer.
 
-use std::process::Command;
+use std::{process::Command, time::Duration};
 
 use log::{info, warn};
+
+use crate::command;
+
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub const PACKAGES: &[&str] = &[
     "android",
@@ -69,7 +73,9 @@ fn resolve_component(args: &[&str]) -> Option<String> {
 }
 
 fn run(path: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(path).args(args).output().ok()?;
+    let mut cmd = Command::new(path);
+    cmd.args(args);
+    let output = command::output(&mut cmd, RESOLVE_TIMEOUT).ok()?;
     if !output.status.success() {
         return None;
     }

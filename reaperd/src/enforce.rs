@@ -4,14 +4,18 @@ use std::{
     collections::{HashMap, VecDeque},
     path::Path,
     process::Command,
+    time::Duration,
 };
 
 use anyhow::{Context, ensure};
+
+use crate::command;
 
 const BUDGET_WINDOW_NS: u64 = 60_000_000_000;
 const MAX_GRACE_MS: u64 = 300_000;
 const MAX_BACKOFF_SHIFT: u32 = 5;
 const CMD_PATH: &str = "/system/bin/cmd";
+const FORCE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Sliding-window limit on force-stops across all apps.
 pub struct KillBudget {
@@ -135,17 +139,20 @@ pub fn force_stop(user: u32, package: &str) -> anyhow::Result<()> {
 }
 
 fn run_force_stop(cmd: &Path, user: u32, package: &str) -> anyhow::Result<()> {
-    let status = Command::new(cmd)
+    let mut process = Command::new(cmd);
+    process
         .arg("activity")
         .arg("force-stop")
         .arg("--user")
         .arg(user.to_string())
-        .arg(package)
-        .status()
+        .arg(package);
+    let output = command::output(&mut process, FORCE_STOP_TIMEOUT)
         .with_context(|| format!("failed to run {}", cmd.display()))?;
     ensure!(
-        status.success(),
-        "force-stop {package} exited with {status}"
+        output.status.success(),
+        "force-stop {package} exited with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(())
 }

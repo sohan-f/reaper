@@ -6,6 +6,7 @@
 //! logged in observe mode.
 
 mod btf;
+mod command;
 mod decide;
 mod enforce;
 mod never_kill;
