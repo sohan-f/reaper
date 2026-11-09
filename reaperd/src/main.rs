@@ -333,11 +333,12 @@ fn trip_budget(daemon: &mut Daemon) {
     if daemon.budget_reported {
         return;
     }
-    daemon.budget_reported = true;
-    error!("kill budget exceeded; switching to observe mode; marker {BUDGET_FILE}");
     if let Err(err) = std::fs::write(BUDGET_FILE, b"kill budget exceeded\n") {
         error!("failed to write {BUDGET_FILE}: {err}");
+        return;
     }
+    daemon.budget_reported = true;
+    error!("kill budget exceeded; switching to observe mode; marker {BUDGET_FILE}");
 }
 
 fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
