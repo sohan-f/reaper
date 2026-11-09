@@ -1,0 +1,8 @@
+[package]
+name = "reaper"
+version = "0.1.0"
+edition = "2024"
+authors = ["Sohan Ali <96324905+sohan-f@users.noreply.github.com>"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
