@@ -403,6 +403,11 @@ fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
                 daemon.would_stop += 1;
                 return;
             }
+            let packages = daemon.uid_map.packages_of(appid);
+            if packages.is_empty() {
+                warn!("uid {owner_uid}: backgrounded but no package name; cannot force-stop");
+                return;
+            }
             if !daemon.budget.allow_kill(now) {
                 trip_budget(daemon);
                 return;
@@ -414,11 +419,6 @@ fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
                     "respawn guard: uid {owner_uid} hit {} kills in {} s; backing off to {backoff_grace} ms grace",
                     daemon.policy.respawn_max, daemon.policy.respawn_window_s
                 );
-            }
-            let packages = daemon.uid_map.packages_of(appid);
-            if packages.is_empty() {
-                warn!("uid {owner_uid}: backgrounded but no package name; cannot force-stop");
-                return;
             }
             let mut stopped = false;
             for package in packages {
