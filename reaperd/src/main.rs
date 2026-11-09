@@ -2,11 +2,13 @@
 //!
 //! Loads the reaper eBPF program, injects the kernel struct offsets resolved
 //! from the device BTF, and drains adj events from the ring buffer through an
-//! epoll loop. The enforcement action (force-stop) is not implemented yet;
-//! matches are logged.
+//! epoll loop. A backgrounded denied app is force-stopped in enforce mode and
+//! logged in observe mode.
 
 mod btf;
 mod decide;
+mod enforce;
+mod never_kill;
 mod pending;
 mod policy;
 mod uidmap;
@@ -29,6 +31,7 @@ use log::{error, info, warn};
 use reaper_common::{DenyCfg, Event};
 
 use crate::decide::Decision;
+use crate::enforce::{KillBudget, RespawnGuard};
 use crate::pending::Pending;
 use crate::policy::{Mode, Policy};
 use crate::uidmap::UidMap;
@@ -41,6 +44,7 @@ const REAPER_DIR: &str = "/data/adb/reaper";
 const ARMED_FILE: &str = "/data/adb/reaper/armed";
 const DISABLE_FILE: &str = "/data/adb/reaper/disable";
 const PANIC_FILE: &str = "/data/adb/reaper/panic";
+const BUDGET_FILE: &str = "/data/adb/reaper/budget-exceeded";
 
 struct Config {
     bpf_object: PathBuf,
@@ -62,9 +66,14 @@ struct Daemon {
     deny_overrides: Vec<(u32, i16)>,
     uid_map: UidMap,
     deny: Vec<DenyEntry>,
+    builtin_never_kill: Vec<String>,
+    budget: KillBudget,
+    respawn: RespawnGuard,
+    budget_reported: bool,
     armed: bool,
     nominations: u64,
     would_stop: u64,
+    stops: u64,
 }
 
 type DenyMapMut<'a> = BpfHashMap<&'a mut aya::maps::MapData, u32, DenyCfg>;
@@ -256,10 +265,15 @@ fn install_deny_map(deny_map: &mut DenyMapMut<'_>, deny: &[DenyEntry]) -> anyhow
     Ok(())
 }
 
-fn build_deny(policy: &Policy, uid_map: &UidMap, overrides: &[(u32, i16)]) -> Vec<DenyEntry> {
+fn build_deny(
+    policy: &Policy,
+    builtin_never_kill: &[String],
+    uid_map: &UidMap,
+    overrides: &[(u32, i16)],
+) -> Vec<DenyEntry> {
     let mut entries: HashMap<u32, DenyEntry> = HashMap::new();
     for rule in &policy.deny {
-        if policy.never_kill.contains(&rule.package) {
+        if policy.never_kill.contains(&rule.package) || builtin_never_kill.contains(&rule.package) {
             warn!(
                 "deny rule for {} ignored: package is in never_kill",
                 rule.package
@@ -296,20 +310,33 @@ fn build_deny(policy: &Policy, uid_map: &UidMap, overrides: &[(u32, i16)]) -> Ve
     entries.into_values().collect()
 }
 
-fn grace_keep_for(daemon: &Daemon, appid: u32) -> (u64, i16) {
+fn deny_params(daemon: &Daemon, appid: u32) -> Option<(u64, i16)> {
     daemon
         .deny
         .iter()
         .find(|entry| entry.appid == appid)
         .map(|entry| (entry.grace_ms, entry.keep_adj))
-        .unwrap_or((daemon.policy.grace_ms, daemon.policy.keep_adj))
 }
 
-fn never_kill_package<'a>(policy: &Policy, packages: &'a [String]) -> Option<&'a str> {
-    packages
-        .iter()
-        .map(String::as_str)
-        .find(|package| policy.never_kill.iter().any(|p| p == package))
+fn never_kill_package<'a>(
+    policy: &Policy,
+    builtin: &[String],
+    packages: &'a [String],
+) -> Option<&'a str> {
+    packages.iter().map(String::as_str).find(|package| {
+        policy.never_kill.iter().any(|p| p == package) || builtin.iter().any(|p| p == package)
+    })
+}
+
+fn trip_budget(daemon: &mut Daemon) {
+    if daemon.budget_reported {
+        return;
+    }
+    daemon.budget_reported = true;
+    error!("kill budget exceeded; switching to observe mode; marker {BUDGET_FILE}");
+    if let Err(err) = std::fs::write(BUDGET_FILE, b"kill budget exceeded\n") {
+        error!("failed to write {BUDGET_FILE}: {err}");
+    }
 }
 
 fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
@@ -320,11 +347,18 @@ fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
         warn!("invalid (user={user}, appid={appid}); dropping");
         return;
     };
-    if let Some(package) = never_kill_package(&daemon.policy, daemon.uid_map.packages_of(appid)) {
+    if let Some(package) = never_kill_package(
+        &daemon.policy,
+        &daemon.builtin_never_kill,
+        daemon.uid_map.packages_of(appid),
+    ) {
         info!("not enforcing user {user} appid {appid}: {package} is in never_kill");
         return;
     }
-    let (_, keep_adj) = grace_keep_for(daemon, appid);
+    let Some((grace_ms, keep_adj)) = deny_params(daemon, appid) else {
+        info!("dropping pending user {user} appid {appid}: no longer denied");
+        return;
+    };
 
     if !daemon.armed {
         info!("pending expired for user {user} appid {appid} but daemon is not armed; dropping");
@@ -348,21 +382,62 @@ fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
             info!("uid {owner_uid}: keep (foreground/visible, min adj {min_adj})");
         }
         Decision::Background { min_adj } => {
-            let packages: Vec<&str> = daemon
-                .uid_map
-                .packages_of(appid)
-                .iter()
-                .map(String::as_str)
-                .collect();
-            let mode = match daemon.policy.mode {
-                Mode::Observe => "observe",
-                Mode::Enforce => "enforce",
-            };
-            info!(
-                "{mode}: would force-stop user {user} uid {owner_uid} appid {appid} min_adj {min_adj} packages [{}]",
-                packages.join(",")
-            );
-            daemon.would_stop += 1;
+            let now = boottime_ns();
+            if daemon.policy.mode == Mode::Observe || daemon.budget.tripped() {
+                let packages: Vec<&str> = daemon
+                    .uid_map
+                    .packages_of(appid)
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                let mode = if daemon.budget.tripped() {
+                    "observe (kill budget tripped)"
+                } else {
+                    "observe"
+                };
+                info!(
+                    "{mode}: would force-stop user {user} uid {owner_uid} appid {appid} min_adj {min_adj} packages [{}]",
+                    packages.join(",")
+                );
+                daemon.would_stop += 1;
+                return;
+            }
+            if !daemon.budget.allow_kill(now) {
+                trip_budget(daemon);
+                return;
+            }
+            if daemon.respawn.tripped(owner_uid, now) {
+                daemon.respawn.back_off(owner_uid, now);
+                let backoff_grace = daemon.respawn.effective_grace(owner_uid, grace_ms, now);
+                error!(
+                    "respawn guard: uid {owner_uid} hit {} kills in {} s; backing off to {backoff_grace} ms grace",
+                    daemon.policy.respawn_max, daemon.policy.respawn_window_s
+                );
+            }
+            let packages = daemon.uid_map.packages_of(appid);
+            if packages.is_empty() {
+                warn!("uid {owner_uid}: backgrounded but no package name; cannot force-stop");
+                return;
+            }
+            let mut stopped = false;
+            for package in packages {
+                match enforce::force_stop(user, package) {
+                    Ok(()) => {
+                        info!(
+                            "force-stopped user {user} uid {owner_uid} appid {appid} package {package}"
+                        );
+                        stopped = true;
+                    }
+                    Err(err) => {
+                        error!("force-stop user {user} package {package} failed: {err:#}");
+                    }
+                }
+            }
+            if stopped {
+                daemon.stops += 1;
+                daemon.budget.record_kill(now);
+                daemon.respawn.record_kill(owner_uid, now);
+            }
         }
     }
 }
@@ -392,7 +467,9 @@ fn sweep(daemon: &mut Daemon) {
             let user = uid / 100_000;
             let adj_values = decide::adj_values_of_uid(uid);
             if let Decision::Background { min_adj } = decide::decide(&adj_values, entry.keep_adj) {
-                let deadline = boottime_ns() + entry.grace_ms * 1_000_000;
+                let now = boottime_ns();
+                let grace_ms = daemon.respawn.effective_grace(uid, entry.grace_ms, now);
+                let deadline = now.saturating_add(grace_ms.saturating_mul(1_000_000));
                 if daemon.pending.insert(user, entry.appid, deadline) {
                     inserted += 1;
                 }
@@ -404,7 +481,12 @@ fn sweep(daemon: &mut Daemon) {
 }
 
 fn rebuild_deny(daemon: &mut Daemon, deny_map: &mut DenyMapMut<'_>) {
-    daemon.deny = build_deny(&daemon.policy, &daemon.uid_map, &daemon.deny_overrides);
+    daemon.deny = build_deny(
+        &daemon.policy,
+        &daemon.builtin_never_kill,
+        &daemon.uid_map,
+        &daemon.deny_overrides,
+    );
     let appids: HashSet<u32> = daemon.deny.iter().map(|entry| entry.appid).collect();
     daemon.pending.retain_appids(&appids);
     if let Err(err) = install_deny_map(deny_map, &daemon.deny) {
@@ -414,6 +496,10 @@ fn rebuild_deny(daemon: &mut Daemon, deny_map: &mut DenyMapMut<'_>) {
 
 fn reload_policy(daemon: &mut Daemon, deny_map: &mut DenyMapMut<'_>) -> anyhow::Result<()> {
     let policy = Policy::load(&daemon.policy_path).context("failed to reload policy")?;
+    daemon.budget.set_limit(policy.kill_budget_per_min);
+    daemon
+        .respawn
+        .set_limits(policy.respawn_window_s, policy.respawn_max);
     daemon.policy = policy;
     daemon.uid_map = UidMap::load(Path::new(PACKAGES_LIST)).unwrap_or_else(|err| {
         warn!("uid map rebuild failed on policy reload: {err:#}");
@@ -479,7 +565,8 @@ fn run() -> anyhow::Result<()> {
         warn!("failed to build uid map: {err:#}");
         UidMap::empty()
     });
-    let deny = build_deny(&policy, &uid_map, &cfg.deny_overrides);
+    let builtin_never_kill = never_kill::resolve();
+    let deny = build_deny(&policy, &builtin_never_kill, &uid_map, &cfg.deny_overrides);
     let [deny_map_raw, ring_map] = bpf.maps_disjoint_mut(["DENY", "RING"]);
     let mut deny_map: DenyMapMut<'_> =
         BpfHashMap::try_from(deny_map_raw.context("DENY map not found in object")?)
@@ -490,6 +577,12 @@ fn run() -> anyhow::Result<()> {
         .context("RING map is not a ring buffer")?;
 
     let armed = Path::new(ARMED_FILE).exists();
+    let budget_tripped = Path::new(BUDGET_FILE).exists();
+    if budget_tripped {
+        warn!("{BUDGET_FILE} present; staying in observe mode");
+    }
+    let budget = KillBudget::new(policy.kill_budget_per_min, budget_tripped);
+    let respawn = RespawnGuard::new(policy.respawn_window_s, policy.respawn_max);
 
     let mut daemon = Daemon {
         pending: Pending::default(),
@@ -498,9 +591,14 @@ fn run() -> anyhow::Result<()> {
         deny_overrides: cfg.deny_overrides,
         uid_map,
         deny,
+        builtin_never_kill,
+        budget,
+        respawn,
+        budget_reported: budget_tripped,
         armed,
         nominations: 0,
         would_stop: 0,
+        stops: 0,
     };
 
     // SAFETY: no preconditions; failure reported as -1 and checked.
@@ -605,9 +703,17 @@ fn run() -> anyhow::Result<()> {
                                 daemon.nominations += 1;
                                 let user = ev.uid / 100_000;
                                 let appid = ev.uid % 100_000;
-                                let (grace_ms, _) = grace_keep_for(&daemon, appid);
                                 let now = boottime_ns();
-                                let deadline = now + grace_ms * 1_000_000;
+                                let Some((grace_ms, _)) = deny_params(&daemon, appid) else {
+                                    info!(
+                                        "dropping nomination for user {user} appid {appid}: no longer denied"
+                                    );
+                                    continue;
+                                };
+                                let grace_ms =
+                                    daemon.respawn.effective_grace(ev.uid, grace_ms, now);
+                                let deadline =
+                                    now.saturating_add(grace_ms.saturating_mul(1_000_000));
                                 if daemon.pending.insert(user, appid, deadline) {
                                     info!(
                                         "pending user {user} appid {appid} adj {} in {} ms",
@@ -729,12 +835,14 @@ fn run() -> anyhow::Result<()> {
                             }
                             libc::SIGUSR2 => {
                                 info!(
-                                    "stats: nominations={} would_stop={} pending={} armed={} deny_entries={}",
+                                    "stats: nominations={} would_stop={} stops={} pending={} armed={} deny_entries={} budget_tripped={}",
                                     daemon.nominations,
                                     daemon.would_stop,
+                                    daemon.stops,
                                     daemon.pending.len(),
                                     daemon.armed,
                                     daemon.deny.len(),
+                                    daemon.budget.tripped(),
                                 );
                             }
                             _ => {}
@@ -769,10 +877,10 @@ mod tests {
             "com.android.systemui".to_string(),
         ];
         assert_eq!(
-            never_kill_package(&policy, &packages),
+            never_kill_package(&policy, &[], &packages),
             Some("com.android.systemui")
         );
-        assert_eq!(never_kill_package(&policy, &[]), None);
+        assert_eq!(never_kill_package(&policy, &[], &[]), None);
     }
 
     #[test]
@@ -789,8 +897,21 @@ mod tests {
         let uid_map = UidMap::parse_packages_list(
             "com.android.systemui 10139 0 /data\ncom.facebook.katana 10293 0 /data\n",
         );
-        let deny = build_deny(&policy, &uid_map, &[]);
+        let deny = build_deny(&policy, &[], &uid_map, &[]);
         assert_eq!(deny.len(), 1);
         assert_eq!(deny[0].appid, 10293);
+    }
+
+    #[test]
+    fn builtin_never_kill_stays_out_of_deny_map() {
+        let mut policy = Policy::default();
+        policy.deny.push(DenyRule {
+            package: "com.android.systemui".to_string(),
+            grace_ms: 2000,
+            keep_adj: 100,
+        });
+        let builtin = vec!["com.android.systemui".to_string()];
+        let uid_map = UidMap::parse_packages_list("com.android.systemui 10139 0 /data\n");
+        assert!(build_deny(&policy, &builtin, &uid_map, &[]).is_empty());
     }
 }
