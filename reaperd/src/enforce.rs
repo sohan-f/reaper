@@ -33,10 +33,12 @@ impl KillBudget {
         }
     }
 
+    /// Reports whether the budget has tripped.
     pub fn tripped(&self) -> bool {
         self.tripped
     }
 
+    /// Replaces the per-window kill limit.
     pub fn set_limit(&mut self, limit: u32) {
         self.limit = limit;
     }
@@ -59,6 +61,7 @@ impl KillBudget {
         true
     }
 
+    /// Records a kill at `now_ns`.
     pub fn record_kill(&mut self, now_ns: u64) {
         self.kills.push_back(now_ns);
     }
@@ -78,6 +81,7 @@ struct Backoff {
 }
 
 impl RespawnGuard {
+    /// Creates a guard with a `window_s` window and a `max` kill limit.
     pub fn new(window_s: u64, max: u32) -> Self {
         Self {
             window_ns: window_s.saturating_mul(1_000_000_000),
@@ -87,11 +91,13 @@ impl RespawnGuard {
         }
     }
 
+    /// Replaces the window and kill limit.
     pub fn set_limits(&mut self, window_s: u64, max: u32) {
         self.window_ns = window_s.saturating_mul(1_000_000_000);
         self.max = max;
     }
 
+    /// Records a kill for `uid` at `now_ns`.
     pub fn record_kill(&mut self, uid: u32, now_ns: u64) {
         self.kills.entry(uid).or_default().push_back(now_ns);
     }
@@ -133,6 +139,11 @@ impl RespawnGuard {
 }
 
 /// Force-stops `package` for `user` by running Android's `cmd`.
+///
+/// # Errors
+///
+/// Returns an error if the command cannot be spawned, does not exit within
+/// the timeout, or exits with a non-zero status.
 pub fn force_stop(user: u32, package: &str) -> anyhow::Result<()> {
     run_force_stop(Path::new(CMD_PATH), user, package)
 }

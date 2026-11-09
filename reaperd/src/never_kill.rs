@@ -8,6 +8,7 @@ use crate::command;
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Packages that are never force-stopped.
 pub const PACKAGES: &[&str] = &[
     "android",
     "com.android.systemui",
