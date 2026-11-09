@@ -266,6 +266,13 @@ fn install_deny_map(deny_map: &mut DenyMapMut<'_>, deny: &[DenyEntry]) -> anyhow
     Ok(())
 }
 
+fn appid_is_never_kill(policy: &Policy, builtin: &[String], uid_map: &UidMap, appid: u32) -> bool {
+    uid_map
+        .packages_of(appid)
+        .iter()
+        .any(|package| policy.never_kill.contains(package) || builtin.contains(package))
+}
+
 fn build_deny(
     policy: &Policy,
     builtin_never_kill: &[String],
@@ -299,6 +306,10 @@ fn build_deny(
         }
     }
     for &(appid, keep_adj) in overrides {
+        if appid_is_never_kill(policy, builtin_never_kill, uid_map, appid) {
+            warn!("--deny appid {appid} ignored: package is in never_kill");
+            continue;
+        }
         entries
             .entry(appid)
             .or_insert(DenyEntry {
@@ -919,5 +930,22 @@ mod tests {
         let builtin = vec!["com.android.systemui".to_string()];
         let uid_map = UidMap::parse_packages_list("com.android.systemui 10139 0 /data\n");
         assert!(build_deny(&policy, &builtin, &uid_map, &[]).is_empty());
+    }
+
+    #[test]
+    fn builtin_never_kill_override_stays_out_of_deny_map() {
+        let policy = Policy::default();
+        let builtin = vec!["com.android.systemui".to_string()];
+        let uid_map = UidMap::parse_packages_list("com.android.systemui 10139 0 /data\n");
+        assert!(build_deny(&policy, &builtin, &uid_map, &[(10139, 100)]).is_empty());
+    }
+
+    #[test]
+    fn deny_override_for_normal_appid_lands() {
+        let policy = Policy::default();
+        let uid_map = UidMap::parse_packages_list("com.example 10123 0 /data\n");
+        let deny = build_deny(&policy, &[], &uid_map, &[(10123, 100)]);
+        assert_eq!(deny.len(), 1);
+        assert_eq!(deny[0].appid, 10123);
     }
 }
