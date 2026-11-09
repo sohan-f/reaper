@@ -387,6 +387,8 @@ fn sweep(daemon: &mut Daemon) {
 
 fn rebuild_deny(daemon: &mut Daemon, deny_map: &mut DenyMapMut<'_>) {
     daemon.deny = build_deny(&daemon.policy, &daemon.uid_map, &daemon.deny_overrides);
+    let appids: HashSet<u32> = daemon.deny.iter().map(|entry| entry.appid).collect();
+    daemon.pending.retain_appids(&appids);
     if let Err(err) = install_deny_map(deny_map, &daemon.deny) {
         error!("failed to update DENY map: {err:#}");
     }

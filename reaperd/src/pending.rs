@@ -37,6 +37,15 @@ impl Pending {
         out
     }
 
+    /// Drops keys whose appid is not in `appids`.
+    pub fn retain_appids(&mut self, appids: &HashSet<u32>) {
+        self.keys.retain(|(_, appid)| appids.contains(appid));
+        self.by_deadline.retain(|_, entries| {
+            entries.retain(|(_, appid)| appids.contains(appid));
+            !entries.is_empty()
+        });
+    }
+
     pub fn earliest(&self) -> Option<u64> {
         self.by_deadline.keys().next().copied()
     }
@@ -57,6 +66,18 @@ mod tests {
         assert!(!pending.insert(0, 10293, 5000));
         assert_eq!(pending.len(), 1);
         assert_eq!(pending.earliest(), Some(1000));
+    }
+
+    #[test]
+    fn retains_only_denied_appids() {
+        let mut pending = Pending::default();
+        pending.insert(0, 10123, 1000);
+        pending.insert(10, 10456, 2000);
+        pending.insert(0, 10789, 3000);
+        pending.retain_appids(&HashSet::from([10123, 10789]));
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.earliest(), Some(1000));
+        assert_eq!(pending.pop_due(3000), vec![(0, 10123), (0, 10789)]);
     }
 
     #[test]
