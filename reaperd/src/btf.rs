@@ -274,7 +274,7 @@ fn payload_size(kind: u32, vlen: usize) -> anyhow::Result<usize> {
         STRUCT | UNION => vlen * 12,
         3 => 12,         // Array
         6 => vlen * 8,   // Enum
-        19 => vlen * 16, // Enum64
+        19 => vlen * 12, // Enum64: name_off, val_lo32, val_hi32
         13 => vlen * 8,  // FuncProto
         15 => vlen * 12, // DataSec
         14 => 4,         // Var: linkage
