@@ -259,6 +259,13 @@ fn install_deny_map(deny_map: &mut DenyMapMut<'_>, deny: &[DenyEntry]) -> anyhow
 fn build_deny(policy: &Policy, uid_map: &UidMap, overrides: &[(u32, i16)]) -> Vec<DenyEntry> {
     let mut entries: HashMap<u32, DenyEntry> = HashMap::new();
     for rule in &policy.deny {
+        if policy.never_kill.contains(&rule.package) {
+            warn!(
+                "deny rule for {} ignored: package is in never_kill",
+                rule.package
+            );
+            continue;
+        }
         match uid_map.appid_of_package(&rule.package) {
             Some(appid) => {
                 entries.insert(
@@ -298,6 +305,13 @@ fn grace_keep_for(daemon: &Daemon, appid: u32) -> (u64, i16) {
         .unwrap_or((daemon.policy.grace_ms, daemon.policy.keep_adj))
 }
 
+fn never_kill_package<'a>(policy: &Policy, packages: &'a [String]) -> Option<&'a str> {
+    packages
+        .iter()
+        .map(String::as_str)
+        .find(|package| policy.never_kill.iter().any(|p| p == package))
+}
+
 fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
     let owner_uid = user
         .checked_mul(100_000)
@@ -306,6 +320,10 @@ fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
         warn!("invalid (user={user}, appid={appid}); dropping");
         return;
     };
+    if let Some(package) = never_kill_package(&daemon.policy, daemon.uid_map.packages_of(appid)) {
+        info!("not enforcing user {user} appid {appid}: {package} is in never_kill");
+        return;
+    }
     let (_, keep_adj) = grace_keep_for(daemon, appid);
 
     if !daemon.armed {
@@ -734,5 +752,25 @@ fn main() {
     if let Err(err) = run() {
         error!("{err:#}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn never_kill_matches_any_package_on_appid() {
+        let mut policy = Policy::default();
+        policy.never_kill.push("com.android.systemui".to_string());
+        let packages = [
+            "com.example.shared".to_string(),
+            "com.android.systemui".to_string(),
+        ];
+        assert_eq!(
+            never_kill_package(&policy, &packages),
+            Some("com.android.systemui")
+        );
+        assert_eq!(never_kill_package(&policy, &[]), None);
     }
 }
