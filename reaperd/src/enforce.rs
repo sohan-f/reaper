@@ -9,10 +9,9 @@ use std::{
 
 use anyhow::{Context, ensure};
 
-use crate::command;
+use crate::{command, policy::MAX_GRACE_MS};
 
 const BUDGET_WINDOW_NS: u64 = 60_000_000_000;
-const MAX_GRACE_MS: u64 = 300_000;
 const MAX_BACKOFF_SHIFT: u32 = 5;
 const CMD_PATH: &str = "/system/bin/cmd";
 const FORCE_STOP_TIMEOUT: Duration = Duration::from_secs(5);

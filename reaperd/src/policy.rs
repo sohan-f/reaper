@@ -8,6 +8,8 @@ use serde::Deserialize;
 
 pub const APPID_START: u32 = 10_000;
 pub const APPID_END: u32 = 19_999;
+/// Upper bound on the effective grace, including backoff.
+pub const MAX_GRACE_MS: u64 = 300_000;
 const DEFAULT_GRACE_MS: u64 = 2_000;
 const DEFAULT_KEEP_ADJ: i16 = 100;
 
@@ -110,6 +112,7 @@ impl Policy {
                 };
             }
             if let Some(v) = global.grace_ms {
+                ensure!(v <= MAX_GRACE_MS, "grace_ms {v} exceeds {MAX_GRACE_MS}");
                 policy.grace_ms = v;
             }
             if let Some(v) = global.keep_adj {
@@ -154,9 +157,15 @@ impl Policy {
                 "keep_adj for {} out of range",
                 entry.package
             );
+            let grace_ms = entry.grace_ms.unwrap_or(policy.grace_ms);
+            ensure!(
+                grace_ms <= MAX_GRACE_MS,
+                "grace_ms for {} exceeds {MAX_GRACE_MS}",
+                entry.package
+            );
             policy.deny.push(DenyRule {
                 package: entry.package,
-                grace_ms: entry.grace_ms.unwrap_or(policy.grace_ms),
+                grace_ms,
                 keep_adj,
             });
         }
@@ -238,5 +247,20 @@ keep_adj = 200
     fn rejects_keep_adj_out_of_range() {
         let text = "[global]\nkeep_adj = 1001\n";
         assert!(Policy::parse(text).is_err());
+    }
+
+    #[test]
+    fn rejects_grace_above_cap() {
+        let text = format!("[global]\ngrace_ms = {}\n", MAX_GRACE_MS + 1);
+        assert!(Policy::parse(&text).is_err());
+    }
+
+    #[test]
+    fn rejects_per_app_grace_above_cap() {
+        let text = format!(
+            "[[deny]]\npackage = \"com.example\"\ngrace_ms = {}\n",
+            MAX_GRACE_MS + 1
+        );
+        assert!(Policy::parse(&text).is_err());
     }
 }
