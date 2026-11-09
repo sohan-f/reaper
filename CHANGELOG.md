@@ -14,5 +14,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loader), `xtask` (build and module packaging).
 - `reaperd` resolves `task_struct`/`signal_struct` offsets from the device
   vmlinux BTF at load and refuses to load on any mismatch.
-- KernelSU module skeleton in `module/` (post-fs-data, boot-completed,
-  uninstall, policy defaulting to observe mode).
+- KernelSU module skeleton in `module/` (customize.sh, post-fs-data,
+  boot-completed, uninstall, policy defaulting to observe mode).

@@ -204,6 +204,7 @@ fn package() -> anyhow::Result<()> {
     }
 
     let module_files = [
+        ("module/customize.sh", "customize.sh", 0o755),
         ("module/module.prop", "module.prop", 0o644),
         ("module/post-fs-data.sh", "post-fs-data.sh", 0o755),
         ("module/boot-completed.sh", "boot-completed.sh", 0o755),
