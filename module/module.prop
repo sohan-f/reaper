@@ -1,0 +1,6 @@
+id=ksu-reaper
+name=ksu-reaper
+version=v0.1.0
+versionCode=1
+author=Sohan Ali
+description=Event-driven background-app enforcer. Ships in observe mode.

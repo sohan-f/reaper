@@ -1,8 +1,33 @@
-[package]
-name = "reaper"
+[workspace]
+resolver = "3"
+members = ["reaper-common", "reaper-ebpf", "reaperd", "xtask"]
+default-members = ["reaper-common", "reaperd", "xtask"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-authors = ["Sohan Ali <96324905+sohan-f@users.noreply.github.com>"]
 license = "MIT OR Apache-2.0"
+authors = ["Sohan Ali <96324905+sohan-f@users.noreply.github.com>"]
 
-[dependencies]
+[workspace.dependencies]
+reaper-common = { path = "reaper-common" }
+aya = "0.16.0"
+aya-ebpf = "0.3.0"
+anyhow = "1.0.104"
+log = "0.4.35"
+libc = "0.2"
+zip = "9.5.0"
+
+# reaper-ebpf is excluded from default-members: it builds only for
+# bpfel-unknown-none via `cargo xtask build-ebpf`.
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# bpf-linker rejects -Oz; the eBPF program does not need size optimization.
+[profile.release.package.reaper-ebpf]
+opt-level = 2

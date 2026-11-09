@@ -1,0 +1,18 @@
+[package]
+name = "reaperd"
+description = "Event-driven background-app enforcer daemon for Android (KernelSU)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+reaper-common = { path = "../reaper-common", features = ["pod"] }
+aya.workspace = true
+anyhow.workspace = true
+log.workspace = true
+libc.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15.1"

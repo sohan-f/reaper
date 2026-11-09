@@ -1,0 +1,29 @@
+[global]
+mode = "observe"            # observe | enforce  (ships as observe)
+grace_ms = 2000             # debounce before acting
+keep_adj = 100              # <=100: foreground/visible, keep
+kill_budget_per_min = 20
+respawn_window_s = 60
+respawn_max = 3
+
+[layer1]
+disable_boot_receivers = true
+appops = ["RUN_ANY_IN_BACKGROUND:ignore", "RUN_IN_BACKGROUND:ignore"]
+standby_bucket = "restricted"
+
+[never_kill]
+packages = ["android", "com.android.systemui", "com.google.android.gms", "com.google.android.gsf", "com.android.vending"]
+
+[[deny]]
+package = "com.facebook.katana"
+
+[[deny]]
+package = "com.facebook.orca"
+
+[[deny]]
+package = "com.instagram.android"
+grace_ms = 30000            # soft mode: tolerate quick app-hopping
+keep_adj = 200              # also tolerate a foreground service (e.g. media)
+
+[[deny]]
+package = "com.twitter.android"

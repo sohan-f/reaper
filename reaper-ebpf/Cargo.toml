@@ -1,0 +1,12 @@
+[package]
+name = "reaper-ebpf"
+description = "eBPF program nominating backgrounded denied apps to reaperd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+reaper-common.workspace = true
+aya-ebpf.workspace = true
