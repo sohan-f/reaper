@@ -22,7 +22,7 @@ pub struct Layout {
     pub sig_oom_adj: u32,
 }
 
-const BTF_MAGIC: u16 = 0xE9BF; // little endian on disk
+const BTF_MAGIC: u16 = 0xEB9F;
 const INT: u32 = 1;
 const PTR: u32 = 2;
 const STRUCT: u32 = 4;
