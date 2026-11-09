@@ -352,6 +352,16 @@ fn trip_budget(daemon: &mut Daemon) {
     error!("kill budget exceeded; switching to observe mode; marker {BUDGET_FILE}");
 }
 
+fn stop_reason() -> Option<&'static str> {
+    if Path::new(DISABLE_FILE).exists() {
+        Some("kill-switch marker present")
+    } else if Path::new(PANIC_FILE).exists() {
+        Some("panic marker present")
+    } else {
+        None
+    }
+}
+
 fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
     let owner_uid = user
         .checked_mul(100_000)
@@ -377,12 +387,8 @@ fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
         info!("pending expired for user {user} appid {appid} but daemon is not armed; dropping");
         return;
     }
-    if Path::new(DISABLE_FILE).exists() {
-        info!("not enforcing user {user} appid {appid}: kill-switch marker present");
-        return;
-    }
-    if Path::new(PANIC_FILE).exists() {
-        info!("not enforcing user {user} appid {appid}: panic marker present");
+    if let Some(reason) = stop_reason() {
+        info!("not enforcing user {user} appid {appid}: {reason}");
         return;
     }
 
@@ -434,6 +440,10 @@ fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
             }
             let mut stopped = false;
             for package in packages {
+                if let Some(reason) = stop_reason() {
+                    info!("stopping force-stop loop: {reason}");
+                    break;
+                }
                 match enforce::force_stop(user, package) {
                     Ok(()) => {
                         info!(
