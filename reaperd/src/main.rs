@@ -433,7 +433,7 @@ fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
             if daemon.respawn.tripped(owner_uid, now) {
                 daemon.respawn.back_off(owner_uid, now);
                 let backoff_grace = daemon.respawn.effective_grace(owner_uid, grace_ms, now);
-                error!(
+                warn!(
                     "respawn guard: uid {owner_uid} hit {} kills in {} s; backing off to {backoff_grace} ms grace",
                     daemon.policy.respawn_max, daemon.policy.respawn_window_s
                 );
