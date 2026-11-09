@@ -758,6 +758,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::DenyRule;
 
     #[test]
     fn never_kill_matches_any_package_on_appid() {
@@ -772,5 +773,24 @@ mod tests {
             Some("com.android.systemui")
         );
         assert_eq!(never_kill_package(&policy, &[]), None);
+    }
+
+    #[test]
+    fn never_kill_package_stays_out_of_deny_map() {
+        let mut policy = Policy::default();
+        policy.never_kill.push("com.android.systemui".to_string());
+        for package in ["com.android.systemui", "com.facebook.katana"] {
+            policy.deny.push(DenyRule {
+                package: package.to_string(),
+                grace_ms: 2000,
+                keep_adj: 100,
+            });
+        }
+        let uid_map = UidMap::parse_packages_list(
+            "com.android.systemui 10139 0 /data\ncom.facebook.katana 10293 0 /data\n",
+        );
+        let deny = build_deny(&policy, &uid_map, &[]);
+        assert_eq!(deny.len(), 1);
+        assert_eq!(deny[0].appid, 10293);
     }
 }
