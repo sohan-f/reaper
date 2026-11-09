@@ -25,8 +25,9 @@ Package the module zip into `dist/`:
 ## Module layout
 
 `cargo xtask package` produces a KernelSU module zip with a `module.prop`,
-`post-fs-data.sh` (starts the daemon), `boot-completed.sh` (arms it),
-`uninstall.sh`, `etc/policy.toml`, `bin/reaperd` and `bin/reaper-ebpf.o`.
+`post-fs-data.sh` (seeds the policy), `boot-completed.sh` (starts and arms the
+daemon), `uninstall.sh`, `etc/policy.toml`, `bin/reaperd` and
+`bin/reaper-ebpf.o`.
 The daemon loads `bin/reaper-ebpf.o` at startup and resolves the kernel
 struct offsets it needs from the device BTF; if that check fails it refuses
 to load.

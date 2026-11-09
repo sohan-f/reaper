@@ -2,6 +2,5 @@
 MODDIR=${0%/*}
 mkdir -p /data/adb/reaper
 [ -f /data/adb/reaper/policy.toml ] || cp "$MODDIR/etc/policy.toml" /data/adb/reaper/policy.toml
-# Deliberately fire and forget; never block post-fs-data.
-nohup "$MODDIR/bin/reaperd" >/dev/null 2>&1 &
+# reaperd loads eBPF, so it must start after Android's load-bpf-programs action.
 exit 0

@@ -20,3 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - KernelSU module skeleton in `module/` (customize.sh, post-fs-data,
   boot-completed, uninstall, policy defaulting to observe mode). Hot install:
   updates go live without a reboot, `hotinstall.sh` restarts reaperd.
+
+### Fixed
+
+- Start `reaperd` from `boot-completed.sh` instead of `post-fs-data.sh`:
+  loading the eBPF object before Android's `bpfloader` makes `bpfloader`
+  abort and reboot the device on Android 16 QPR1+.

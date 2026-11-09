@@ -540,6 +540,13 @@ fn run() -> anyhow::Result<()> {
     watch(inotify_fd, 3)?;
     watch(signal_fd, 4)?;
 
+    // boot-completed.sh creates the marker before starting the daemon, so the
+    // inotify transition is not observed on a normal boot.
+    if daemon.armed {
+        sweep(&mut daemon);
+        rearm_timer(timer_fd, daemon.pending.earliest())?;
+    }
+
     info!(
         "watching nominations; armed={}; blocking in epoll_wait",
         daemon.armed
