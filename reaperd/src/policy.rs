@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use anyhow::{Context, bail, ensure};
+use log::warn;
 use serde::Deserialize;
 
 pub const APPID_START: u32 = 10_000;
@@ -31,6 +32,7 @@ pub struct Policy {
     pub kill_budget_per_min: u32,
     pub respawn_window_s: u64,
     pub respawn_max: u32,
+    pub never_kill: Vec<String>,
     pub deny: Vec<DenyRule>,
 }
 
@@ -43,6 +45,7 @@ impl Default for Policy {
             kill_budget_per_min: 20,
             respawn_window_s: 60,
             respawn_max: 3,
+            never_kill: Vec::new(),
             deny: Vec::new(),
         }
     }
@@ -68,8 +71,17 @@ struct RawDeny {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNeverKill {
+    packages: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPolicy {
     global: Option<RawGlobal>,
+    layer1: Option<toml::Value>,
+    never_kill: Option<RawNeverKill>,
     deny: Option<Vec<RawDeny>>,
 }
 
@@ -113,6 +125,22 @@ impl Policy {
             if let Some(v) = global.respawn_max {
                 policy.respawn_max = v;
             }
+        }
+
+        if raw.layer1.is_some() {
+            warn!("policy [layer1] settings are not applied");
+        }
+
+        for package in raw
+            .never_kill
+            .and_then(|never_kill| never_kill.packages)
+            .unwrap_or_default()
+        {
+            ensure!(
+                !package.is_empty(),
+                "policy contains an empty never_kill package name"
+            );
+            policy.never_kill.push(package);
         }
 
         for entry in raw.deny.unwrap_or_default() {
@@ -181,10 +209,23 @@ keep_adj = 200
         assert_eq!(policy.grace_ms, 2000);
         assert_eq!(policy.keep_adj, 100);
         assert_eq!(policy.deny.len(), 2);
+        assert_eq!(policy.never_kill, ["android", "com.android.systemui"]);
         assert_eq!(policy.deny[1].grace_ms, 30000);
         assert_eq!(policy.deny[1].keep_adj, 200);
         assert_eq!(policy.deny[0].grace_ms, 2000);
         assert_eq!(policy.deny[0].keep_adj, 100);
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_key() {
+        let text = "[global]\nmode = \"observe\"\n\n[neverkill]\npackages = [\"android\"]\n";
+        assert!(Policy::parse(text).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_never_kill_key() {
+        let text = "[never_kill]\npackage = [\"android\"]\n";
+        assert!(Policy::parse(text).is_err());
     }
 
     #[test]
