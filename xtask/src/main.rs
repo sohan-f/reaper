@@ -207,6 +207,7 @@ fn package() -> anyhow::Result<()> {
         ("module/customize.sh", "customize.sh", 0o755),
         ("module/module.prop", "module.prop", 0o644),
         ("module/post-fs-data.sh", "post-fs-data.sh", 0o755),
+        ("module/hotinstall.sh", "hotinstall.sh", 0o755),
         ("module/boot-completed.sh", "boot-completed.sh", 0o755),
         ("module/uninstall.sh", "uninstall.sh", 0o755),
         ("module/etc/policy.toml", "etc/policy.toml", 0o644),
