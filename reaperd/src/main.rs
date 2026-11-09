@@ -12,7 +12,7 @@ mod policy;
 mod uidmap;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     os::fd::AsRawFd,
     os::unix::io::RawFd,
     path::{Path, PathBuf},
@@ -229,6 +229,18 @@ fn rearm_timer(fd: RawFd, deadline_ns: Option<u64>) -> anyhow::Result<()> {
 }
 
 fn install_deny_map(deny_map: &mut DenyMapMut<'_>, deny: &[DenyEntry]) -> anyhow::Result<()> {
+    let wanted: HashSet<u32> = deny.iter().map(|entry| entry.appid).collect();
+    let current: Vec<u32> = deny_map
+        .keys()
+        .collect::<Result<_, _>>()
+        .context("failed to list DENY map keys")?;
+    for appid in current {
+        if !wanted.contains(&appid) {
+            deny_map
+                .remove(&appid)
+                .with_context(|| format!("failed to remove deny entry for appid {appid}"))?;
+        }
+    }
     for entry in deny {
         deny_map
             .insert(
