@@ -1,41 +1,82 @@
-//! reaperd: event-driven background-app enforcer daemon.
+//! reaperd: background-app enforcer daemon.
 //!
-//! Loads the reaper eBPF program, injects the struct offsets resolved from the
-//! device BTF, and drains nominations from the ring buffer. Enforcement and
-//! the epoll fd set beyond the ring buffer land in later milestones.
+//! Loads the reaper eBPF program, injects the kernel struct offsets resolved
+//! from the device BTF, and drains adj events from the ring buffer through an
+//! epoll loop. The enforcement action (force-stop) is not implemented yet;
+//! matches are logged.
 
 mod btf;
+mod decide;
+mod pending;
+mod policy;
+mod uidmap;
 
-use std::{os::fd::AsRawFd, path::PathBuf, process};
+use std::{
+    collections::HashMap,
+    os::fd::AsRawFd,
+    os::unix::io::RawFd,
+    path::{Path, PathBuf},
+    process,
+};
 
 use anyhow::{Context, bail, ensure};
 use aya::{
     EbpfLoader, Endianness,
-    maps::{HashMap, RingBuf},
+    maps::{HashMap as BpfHashMap, RingBuf},
     programs::BtfTracePoint,
 };
 use log::{error, info, warn};
 use reaper_common::{DenyCfg, Event};
 
+use crate::decide::Decision;
+use crate::pending::Pending;
+use crate::policy::{Mode, Policy};
+use crate::uidmap::UidMap;
+
 const DEFAULT_BPF_OBJECT: &str = "/data/adb/modules/ksu-reaper/bin/reaper-ebpf.o";
 const DEFAULT_BTF: &str = "/sys/kernel/btf/vmlinux";
-const APPID_START: u32 = 10_000;
-const APPID_END: u32 = 19_999;
+const DEFAULT_POLICY: &str = "/data/adb/reaper/policy.toml";
+const PACKAGES_LIST: &str = "/data/system/packages.list";
+const REAPER_DIR: &str = "/data/adb/reaper";
+const ARMED_FILE: &str = "/data/adb/reaper/armed";
+const DISABLE_FILE: &str = "/data/adb/reaper/disable";
+const PANIC_FILE: &str = "/data/adb/reaper/panic";
 
 struct Config {
     bpf_object: PathBuf,
     btf: PathBuf,
-    deny: Vec<(u32, i16)>,
+    policy: PathBuf,
+    deny_overrides: Vec<(u32, i16)>,
 }
+
+struct DenyEntry {
+    appid: u32,
+    keep_adj: i16,
+    grace_ms: u64,
+}
+
+struct Daemon {
+    pending: Pending,
+    policy: Policy,
+    policy_path: PathBuf,
+    deny_overrides: Vec<(u32, i16)>,
+    uid_map: UidMap,
+    deny: Vec<DenyEntry>,
+    armed: bool,
+    nominations: u64,
+    would_stop: u64,
+}
+
+type DenyMapMut<'a> = BpfHashMap<&'a mut aya::maps::MapData, u32, DenyCfg>;
 
 fn print_usage() {
     eprintln!(
-        "usage: reaperd [--bpf-object PATH] [--btf PATH] [--deny APPID[:KEEP_ADJ]]...
+        "usage: reaperd [--bpf-object PATH] [--btf PATH] [--policy PATH] [--deny APPID[:KEEP_ADJ]]...
   --bpf-object PATH  eBPF object to load (default: {DEFAULT_BPF_OBJECT}, env REAPER_BPF_OBJECT)
   --btf PATH         vmlinux BTF (default: {DEFAULT_BTF})
+  --policy PATH      policy file (default: {DEFAULT_POLICY})
   --deny APPID[:KEEP_ADJ]
-                     populate the DENY map (repeatable); appid must be 10000..=19999,
-                     keep_adj defaults to 100 and is the largest adj worth keeping"
+                     additional deny entries; appid must be 10000..=19999"
     );
 }
 
@@ -45,7 +86,8 @@ fn parse_args() -> anyhow::Result<Config> {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_BPF_OBJECT)),
         btf: PathBuf::from(DEFAULT_BTF),
-        deny: Vec::new(),
+        policy: PathBuf::from(DEFAULT_POLICY),
+        deny_overrides: Vec::new(),
     };
 
     let mut args = std::env::args().skip(1);
@@ -55,9 +97,10 @@ fn parse_args() -> anyhow::Result<Config> {
                 cfg.bpf_object = PathBuf::from(args.next().context("--bpf-object needs a path")?)
             }
             "--btf" => cfg.btf = PathBuf::from(args.next().context("--btf needs a path")?),
+            "--policy" => cfg.policy = PathBuf::from(args.next().context("--policy needs a path")?),
             "--deny" => {
                 let spec = args.next().context("--deny needs APPID[:KEEP_ADJ]")?;
-                cfg.deny.push(parse_deny(&spec)?);
+                cfg.deny_overrides.push(parse_deny(&spec)?);
             }
             "-h" | "--help" => {
                 print_usage();
@@ -83,8 +126,12 @@ fn parse_deny(spec: &str) -> anyhow::Result<(u32, i16)> {
             100,
         ),
     };
-    if !(APPID_START..=APPID_END).contains(&appid) {
-        bail!("appid {appid} outside {APPID_START}..={APPID_END}");
+    if !(crate::policy::APPID_START..=crate::policy::APPID_END).contains(&appid) {
+        bail!(
+            "appid {appid} outside {}..={}",
+            crate::policy::APPID_START,
+            crate::policy::APPID_END
+        );
     }
     Ok((appid, keep_adj))
 }
@@ -137,9 +184,212 @@ fn parse_event(bytes: &[u8]) -> Option<Event> {
         uid: word(0)?,
         tgid: word(4)?,
         adj: i32::from_ne_bytes(bytes.get(8..12)?.try_into().ok()?),
-        _pad: word(3 * 4)?,
+        _pad: word(12)?,
         ts_ns: u64::from_ne_bytes(bytes.get(16..24)?.try_into().ok()?),
     })
+}
+
+fn boottime_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: ts is a writable timespec and CLOCK_BOOTTIME is always supported.
+    unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
+    (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+fn rearm_timer(fd: RawFd, deadline_ns: Option<u64>) -> anyhow::Result<()> {
+    let rel = deadline_ns.map(|d| d.saturating_sub(boottime_ns()));
+    let mut its = libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+    };
+    if let Some(rel) = rel {
+        its.it_value.tv_sec = (rel / 1_000_000_000) as libc::time_t;
+        its.it_value.tv_nsec = (rel % 1_000_000_000) as libc::c_long;
+        if its.it_value.tv_sec == 0 && its.it_value.tv_nsec == 0 {
+            its.it_value.tv_nsec = 1_000_000;
+        }
+    }
+    // SAFETY: fd is a valid timerfd created by this process; its is a valid itimerspec.
+    let rc = unsafe { libc::timerfd_settime(fd, 0, &its, std::ptr::null_mut()) };
+    ensure!(
+        rc == 0,
+        "timerfd_settime failed: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(())
+}
+
+fn install_deny_map(deny_map: &mut DenyMapMut<'_>, deny: &[DenyEntry]) -> anyhow::Result<()> {
+    for entry in deny {
+        deny_map
+            .insert(
+                &entry.appid,
+                &DenyCfg {
+                    keep_adj: entry.keep_adj,
+                    flags: 0,
+                },
+                0,
+            )
+            .with_context(|| format!("failed to insert deny entry for appid {}", entry.appid))?;
+    }
+    Ok(())
+}
+
+fn build_deny(policy: &Policy, uid_map: &UidMap, overrides: &[(u32, i16)]) -> Vec<DenyEntry> {
+    let mut entries: HashMap<u32, DenyEntry> = HashMap::new();
+    for rule in &policy.deny {
+        match uid_map.appid_of_package(&rule.package) {
+            Some(appid) => {
+                entries.insert(
+                    appid,
+                    DenyEntry {
+                        appid,
+                        keep_adj: rule.keep_adj,
+                        grace_ms: rule.grace_ms,
+                    },
+                );
+            }
+            None => warn!(
+                "deny rule for {} resolves to no appid; skipping",
+                rule.package
+            ),
+        }
+    }
+    for &(appid, keep_adj) in overrides {
+        entries
+            .entry(appid)
+            .or_insert(DenyEntry {
+                appid,
+                keep_adj,
+                grace_ms: policy.grace_ms,
+            })
+            .keep_adj = keep_adj;
+    }
+    entries.into_values().collect()
+}
+
+fn grace_keep_for(daemon: &Daemon, appid: u32) -> (u64, i16) {
+    daemon
+        .deny
+        .iter()
+        .find(|entry| entry.appid == appid)
+        .map(|entry| (entry.grace_ms, entry.keep_adj))
+        .unwrap_or((daemon.policy.grace_ms, daemon.policy.keep_adj))
+}
+
+fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
+    let owner_uid = user
+        .checked_mul(100_000)
+        .and_then(|base| base.checked_add(appid));
+    let Some(owner_uid) = owner_uid else {
+        warn!("invalid (user={user}, appid={appid}); dropping");
+        return;
+    };
+    let (_, keep_adj) = grace_keep_for(daemon, appid);
+
+    if !daemon.armed {
+        info!("pending expired for user {user} appid {appid} but daemon is not armed; dropping");
+        return;
+    }
+    if Path::new(DISABLE_FILE).exists() {
+        info!("not enforcing user {user} appid {appid}: kill-switch marker present");
+        return;
+    }
+    if Path::new(PANIC_FILE).exists() {
+        info!("not enforcing user {user} appid {appid}: panic marker present");
+        return;
+    }
+
+    let adj_values = decide::adj_values_of_uid(owner_uid);
+    match decide::decide(&adj_values, keep_adj) {
+        Decision::Gone => {
+            info!("uid {owner_uid}: no live processes; app already gone");
+        }
+        Decision::Keep { min_adj } => {
+            info!("uid {owner_uid}: keep (foreground/visible, min adj {min_adj})");
+        }
+        Decision::Background { min_adj } => {
+            let packages: Vec<&str> = daemon
+                .uid_map
+                .packages_of(appid)
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let mode = match daemon.policy.mode {
+                Mode::Observe => "observe",
+                Mode::Enforce => "enforce",
+            };
+            info!(
+                "{mode}: would force-stop user {user} uid {owner_uid} appid {appid} min_adj {min_adj} packages [{}]",
+                packages.join(",")
+            );
+            daemon.would_stop += 1;
+        }
+    }
+}
+
+fn sweep(daemon: &mut Daemon) {
+    let mut inserted = 0u32;
+    let Ok(uid_dirs) = std::fs::read_dir("/sys/fs/cgroup/apps") else {
+        warn!("sweep: /sys/fs/cgroup/apps unreadable");
+        return;
+    };
+    let uid_dirs: Vec<u32> = uid_dirs
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix("uid_"))?
+                .parse::<u32>()
+                .ok()
+        })
+        .collect();
+    for entry in &daemon.deny {
+        for &uid in &uid_dirs {
+            if uid % 100_000 != entry.appid {
+                continue;
+            }
+            let user = uid / 100_000;
+            let adj_values = decide::adj_values_of_uid(uid);
+            if let Decision::Background { min_adj } = decide::decide(&adj_values, entry.keep_adj) {
+                let deadline = boottime_ns() + entry.grace_ms * 1_000_000;
+                if daemon.pending.insert(user, entry.appid, deadline) {
+                    inserted += 1;
+                }
+                info!("sweep: uid {uid} backgrounded (min adj {min_adj}); pending");
+            }
+        }
+    }
+    info!("sweep done: {inserted} pending");
+}
+
+fn rebuild_deny(daemon: &mut Daemon, deny_map: &mut DenyMapMut<'_>) {
+    daemon.deny = build_deny(&daemon.policy, &daemon.uid_map, &daemon.deny_overrides);
+    if let Err(err) = install_deny_map(deny_map, &daemon.deny) {
+        error!("failed to update DENY map: {err:#}");
+    }
+}
+
+fn reload_policy(daemon: &mut Daemon, deny_map: &mut DenyMapMut<'_>) -> anyhow::Result<()> {
+    let policy = Policy::load(&daemon.policy_path).context("failed to reload policy")?;
+    daemon.policy = policy;
+    daemon.uid_map = UidMap::load(Path::new(PACKAGES_LIST)).unwrap_or_else(|err| {
+        warn!("uid map rebuild failed on policy reload: {err:#}");
+        UidMap::empty()
+    });
+    rebuild_deny(daemon, deny_map);
+    info!("policy reloaded: {} deny entries", daemon.deny.len());
+    Ok(())
 }
 
 fn run() -> anyhow::Result<()> {
@@ -181,40 +431,120 @@ fn run() -> anyhow::Result<()> {
         .attach()
         .context("failed to attach to tp_btf/oom_score_adj_update")?;
 
-    if !cfg.deny.is_empty() {
-        let map = bpf
-            .map_mut("DENY")
-            .context("DENY map not found in object")?;
-        let mut deny: HashMap<_, u32, DenyCfg> =
-            HashMap::try_from(map).context("DENY map has unexpected shape")?;
-        for &(appid, keep_adj) in &cfg.deny {
-            deny.insert(&appid, &DenyCfg { keep_adj, flags: 0 }, 0)
-                .with_context(|| format!("failed to insert deny entry for appid {appid}"))?;
+    let _ = std::fs::create_dir_all(REAPER_DIR);
+
+    let policy = match Policy::load(&cfg.policy) {
+        Ok(policy) => policy,
+        Err(err) => {
+            error!(
+                "failed to load {}: {err:#}; continuing with observe defaults",
+                cfg.policy.display()
+            );
+            Policy::default()
         }
-        info!("populated DENY map with {} entries", cfg.deny.len());
+    };
+    let uid_map = UidMap::load(Path::new(PACKAGES_LIST)).unwrap_or_else(|err| {
+        warn!("failed to build uid map: {err:#}");
+        UidMap::empty()
+    });
+    let deny = build_deny(&policy, &uid_map, &cfg.deny_overrides);
+    let [deny_map_raw, ring_map] = bpf.maps_disjoint_mut(["DENY", "RING"]);
+    let mut deny_map: DenyMapMut<'_> =
+        BpfHashMap::try_from(deny_map_raw.context("DENY map not found in object")?)
+            .context("DENY map has unexpected shape")?;
+    install_deny_map(&mut deny_map, &deny)?;
+    info!("populated DENY map with {} entries", deny.len());
+    let mut ring = RingBuf::try_from(ring_map.context("RING map not found in object")?)
+        .context("RING map is not a ring buffer")?;
+
+    let armed = Path::new(ARMED_FILE).exists();
+
+    let mut daemon = Daemon {
+        pending: Pending::default(),
+        policy,
+        policy_path: cfg.policy,
+        deny_overrides: cfg.deny_overrides,
+        uid_map,
+        deny,
+        armed,
+        nominations: 0,
+        would_stop: 0,
+    };
+
+    // SAFETY: no preconditions; failure reported as -1 and checked.
+    let inotify_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+    ensure!(inotify_fd >= 0, "inotify_init1 failed");
+    let reaper_wd = unsafe {
+        // SAFETY: inotify_fd is valid; the path is a valid C string.
+        libc::inotify_add_watch(
+            inotify_fd,
+            c"/data/adb/reaper".as_ptr(),
+            libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_DELETE | libc::IN_CREATE,
+        )
+    };
+    ensure!(reaper_wd >= 0, "inotify_add_watch on {REAPER_DIR} failed");
+    let system_wd = unsafe {
+        // SAFETY: inotify_fd is valid; the path is a valid C string.
+        libc::inotify_add_watch(
+            inotify_fd,
+            c"/data/system".as_ptr(),
+            libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO,
+        )
+    };
+    if system_wd < 0 {
+        warn!("cannot watch /data/system for packages.list; package changes need SIGHUP to reload");
     }
 
-    let ring_map = bpf
-        .map_mut("RING")
-        .context("RING map not found in object")?;
-    let mut ring = RingBuf::try_from(ring_map).context("RING map is not a ring buffer")?;
+    // SAFETY: sigset_t is zero-initializable POD.
+    let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: sigset points to a valid sigset_t.
+    unsafe { libc::sigemptyset(&mut sigset) };
+    for sig in [libc::SIGHUP, libc::SIGTERM, libc::SIGUSR1, libc::SIGUSR2] {
+        // SAFETY: sigset is valid and sig is a valid signal number.
+        unsafe { libc::sigaddset(&mut sigset, sig) };
+    }
+    // SAFETY: sigset is a valid sigset_t.
+    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut()) };
+    let signal_fd = unsafe {
+        // SAFETY: signal_fd outlives the loop; flags are valid.
+        libc::signalfd(-1, &sigset, libc::SFD_CLOEXEC)
+    };
+    ensure!(signal_fd >= 0, "signalfd failed");
 
-    // SAFETY: epoll_create1 has no preconditions; failure is reported as -1 and checked.
+    let timer_fd = unsafe {
+        // SAFETY: CLOCK_BOOTTIME is supported on this kernel.
+        libc::timerfd_create(libc::CLOCK_BOOTTIME, libc::TFD_CLOEXEC)
+    };
+    ensure!(timer_fd >= 0, "timerfd_create failed");
+
+    // SAFETY: no preconditions; failure reported as -1 and checked.
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     ensure!(epfd >= 0, "epoll_create1 failed");
-    let mut event = libc::epoll_event {
-        events: libc::EPOLLIN as u32,
-        u64: 1,
+
+    let watch = |fd: RawFd, tag: u64| -> anyhow::Result<()> {
+        let mut event = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: tag,
+        };
+        // SAFETY: epfd and fd are valid open fds; event outlives the call.
+        let rc = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut event) };
+        ensure!(
+            rc == 0,
+            "epoll_ctl(ADD, fd={fd}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(())
     };
-    // SAFETY: epfd and ring_fd are valid open fds; event references outlive the call.
-    let rc = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, ring.as_raw_fd(), &mut event) };
-    ensure!(
-        rc == 0,
-        "epoll_ctl(ADD) failed: {}",
-        std::io::Error::last_os_error()
+    watch(ring.as_raw_fd(), 1)?;
+    watch(timer_fd, 2)?;
+    watch(inotify_fd, 3)?;
+    watch(signal_fd, 4)?;
+
+    info!(
+        "watching nominations; armed={}; blocking in epoll_wait",
+        daemon.armed
     );
 
-    info!("watching nominations; blocking in epoll_wait");
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 16];
     loop {
         // SAFETY: events is a writable buffer of the reported size.
@@ -227,15 +557,152 @@ fn run() -> anyhow::Result<()> {
             error!("epoll_wait failed: {err}");
             bail!("epoll_wait: {err}");
         }
-        for _ in 0..n {
-            while let Some(item) = ring.next() {
-                match parse_event(&item) {
-                    Some(ev) => info!(
-                        "nomination uid={} tgid={} adj={} ts_ns={}",
-                        ev.uid, ev.tgid, ev.adj, ev.ts_ns
-                    ),
-                    None => warn!("malformed ring buffer event (len {})", item.len()),
+        for event in events.iter().take(n as usize) {
+            match event.u64 {
+                1 => {
+                    while let Some(item) = ring.next() {
+                        match parse_event(&item) {
+                            Some(ev) => {
+                                daemon.nominations += 1;
+                                let user = ev.uid / 100_000;
+                                let appid = ev.uid % 100_000;
+                                let (grace_ms, _) = grace_keep_for(&daemon, appid);
+                                let now = boottime_ns();
+                                let deadline = now + grace_ms * 1_000_000;
+                                if daemon.pending.insert(user, appid, deadline) {
+                                    info!(
+                                        "pending user {user} appid {appid} adj {} in {} ms",
+                                        ev.adj, grace_ms
+                                    );
+                                }
+                                rearm_timer(timer_fd, daemon.pending.earliest())?;
+                            }
+                            None => warn!("malformed ring buffer event (len {})", item.len()),
+                        }
+                    }
                 }
+                2 => {
+                    let mut expirations: u64 = 0;
+                    // SAFETY: expirations is a writable u64; timer_fd is valid.
+                    let rc = unsafe {
+                        libc::read(
+                            timer_fd,
+                            &mut expirations as *mut u64 as *mut libc::c_void,
+                            8,
+                        )
+                    };
+                    if rc != 8 {
+                        warn!("timerfd read returned {rc}");
+                    }
+                    let now = boottime_ns();
+                    let due = daemon.pending.pop_due(now);
+                    for (user, appid) in due {
+                        decide_and_log(&mut daemon, user, appid);
+                    }
+                    rearm_timer(timer_fd, daemon.pending.earliest())?;
+                }
+                3 => {
+                    let mut buf = [0u8; 4096];
+                    // SAFETY: buf is writable; inotify_fd is a valid nonblocking fd.
+                    let rc = unsafe {
+                        libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                    };
+                    if rc > 0 {
+                        let mut offset = 0usize;
+                        while offset + 16 <= rc as usize {
+                            let wd =
+                                i32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap());
+                            let mask =
+                                u32::from_ne_bytes(buf[offset + 4..offset + 8].try_into().unwrap());
+                            let len = u32::from_ne_bytes(
+                                buf[offset + 12..offset + 16].try_into().unwrap(),
+                            ) as usize;
+                            let name_start = offset + 16;
+                            let name_end = (name_start + len).min(rc as usize);
+                            let name = String::from_utf8_lossy(&buf[name_start..name_end]);
+                            let name = name.trim_end_matches('\0').to_string();
+                            if wd == reaper_wd {
+                                if name == "armed" {
+                                    let armed = Path::new(ARMED_FILE).exists();
+                                    if armed && !daemon.armed {
+                                        daemon.armed = true;
+                                        info!("armed; enforcing");
+                                        sweep(&mut daemon);
+                                        rearm_timer(timer_fd, daemon.pending.earliest())?;
+                                    } else if !armed && daemon.armed {
+                                        daemon.armed = false;
+                                        info!("disarmed");
+                                    }
+                                } else if name == "disable" {
+                                    info!("kill-switch marker changed");
+                                } else if name == "panic" {
+                                    info!("panic marker changed");
+                                } else if name == "policy.toml"
+                                    && mask & (libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO) != 0
+                                    && let Err(err) = reload_policy(&mut daemon, &mut deny_map)
+                                {
+                                    error!("policy reload failed: {err:#}");
+                                }
+                            } else if wd == system_wd
+                                && name == "packages.list"
+                                && mask & (libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO) != 0
+                            {
+                                match UidMap::load(Path::new(PACKAGES_LIST)) {
+                                    Ok(map) => {
+                                        info!("uid map rebuilt: {} packages", map.package_count());
+                                        daemon.uid_map = map;
+                                        rebuild_deny(&mut daemon, &mut deny_map);
+                                    }
+                                    Err(err) => error!("failed to rebuild uid map: {err:#}"),
+                                }
+                            }
+                            offset = name_start + len;
+                        }
+                    }
+                }
+                4 => {
+                    // SAFETY: signalfd_siginfo is zero-initializable POD.
+                    let mut siginfo: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
+                    // SAFETY: siginfo is a valid signalfd_siginfo; signal_fd is valid.
+                    let rc = unsafe {
+                        libc::read(
+                            signal_fd,
+                            &mut siginfo as *mut _ as *mut libc::c_void,
+                            std::mem::size_of::<libc::signalfd_siginfo>(),
+                        )
+                    };
+                    if rc == std::mem::size_of::<libc::signalfd_siginfo>() as isize {
+                        match siginfo.ssi_signo as i32 {
+                            libc::SIGHUP => {
+                                if let Err(err) = reload_policy(&mut daemon, &mut deny_map) {
+                                    error!("policy reload failed: {err:#}");
+                                }
+                            }
+                            libc::SIGTERM => {
+                                info!("SIGTERM received; exiting");
+                                return Ok(());
+                            }
+                            libc::SIGUSR1 => {
+                                daemon.armed = true;
+                                info!("SIGUSR1: armed; enforcing");
+                                sweep(&mut daemon);
+                                rearm_timer(timer_fd, daemon.pending.earliest())?;
+                            }
+                            libc::SIGUSR2 => {
+                                info!(
+                                    "stats: nominations={} would_stop={} pending={} armed={} deny_entries={}",
+                                    daemon.nominations,
+                                    daemon.would_stop,
+                                    daemon.pending.len(),
+                                    daemon.armed,
+                                    daemon.deny.len(),
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                other => warn!("unknown epoll tag {other}"),
             }
         }
     }
