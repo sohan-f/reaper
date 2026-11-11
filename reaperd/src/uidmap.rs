@@ -55,6 +55,10 @@ impl UidMap {
         self.instances_by_package.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.instances_by_package.is_empty()
+    }
+
     /// Returns the user ids present in the map, sorted.
     pub fn users(&self) -> Vec<u32> {
         let mut users: Vec<u32> = self.user_ids.iter().copied().collect();

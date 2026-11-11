@@ -9,6 +9,7 @@ mod btf;
 mod command;
 mod decide;
 mod enforce;
+mod layer1;
 mod never_kill;
 mod pending;
 mod policy;
@@ -46,12 +47,14 @@ const ARMED_FILE: &str = "/data/adb/reaper/armed";
 const DISABLE_FILE: &str = "/data/adb/reaper/disable";
 const PANIC_FILE: &str = "/data/adb/reaper/panic";
 const BUDGET_FILE: &str = "/data/adb/reaper/budget-exceeded";
+const LAYER1_JOURNAL: &str = "/data/adb/reaper/layer1-journal.toml";
 
 struct Config {
     bpf_object: PathBuf,
     btf: PathBuf,
     policy: PathBuf,
     deny_overrides: Vec<(u32, i16)>,
+    restore_layer1: bool,
 }
 
 struct DenyEntry {
@@ -72,6 +75,8 @@ struct Daemon {
     respawn: RespawnGuard,
     budget_reported: bool,
     armed: bool,
+    policy_ready: bool,
+    uid_map_ready: bool,
     nominations: u64,
     would_stop: u64,
     stops: u64,
@@ -81,12 +86,13 @@ type DenyMapMut<'a> = BpfHashMap<&'a mut aya::maps::MapData, u32, DenyCfg>;
 
 fn print_usage() {
     eprintln!(
-        "usage: reaperd [--bpf-object PATH] [--btf PATH] [--policy PATH] [--deny APPID[:KEEP_ADJ]]...
+        "usage: reaperd [--bpf-object PATH] [--btf PATH] [--policy PATH] [--deny APPID[:KEEP_ADJ]]... [--restore-layer1]
   --bpf-object PATH  eBPF object to load (default: {DEFAULT_BPF_OBJECT}, env REAPER_BPF_OBJECT)
   --btf PATH         vmlinux BTF (default: {DEFAULT_BTF})
   --policy PATH      policy file (default: {DEFAULT_POLICY})
   --deny APPID[:KEEP_ADJ]
-                     additional deny entries; appid must be 10000..=19999"
+                     additional deny entries; appid must be 10000..=19999
+  --restore-layer1   restore journaled Layer 1 state and exit; needs no policy or kernel"
     );
 }
 
@@ -98,6 +104,7 @@ fn parse_args() -> anyhow::Result<Config> {
         btf: PathBuf::from(DEFAULT_BTF),
         policy: PathBuf::from(DEFAULT_POLICY),
         deny_overrides: Vec::new(),
+        restore_layer1: false,
     };
 
     let mut args = std::env::args().skip(1);
@@ -112,6 +119,7 @@ fn parse_args() -> anyhow::Result<Config> {
                 let spec = args.next().context("--deny needs APPID[:KEEP_ADJ]")?;
                 cfg.deny_overrides.push(parse_deny(&spec)?);
             }
+            "--restore-layer1" => cfg.restore_layer1 = true,
             "-h" | "--help" => {
                 print_usage();
                 process::exit(0);
@@ -362,6 +370,31 @@ fn stop_reason() -> Option<&'static str> {
     }
 }
 
+fn layer1_apply_allowed(daemon: &Daemon) -> bool {
+    daemon.armed && daemon.policy.mode == Mode::Enforce && stop_reason().is_none()
+}
+
+fn reconcile_layer1(daemon: &Daemon) {
+    if !daemon.policy_ready {
+        warn!("Layer 1 skipped: policy is not loaded");
+        return;
+    }
+    let uid_map = if daemon.uid_map_ready && !daemon.uid_map.is_empty() {
+        Some(&daemon.uid_map)
+    } else {
+        None
+    };
+    let mut ops = layer1::AndroidOps;
+    layer1::reconcile(
+        &daemon.policy,
+        &daemon.builtin_never_kill,
+        uid_map,
+        &mut ops,
+        Path::new(LAYER1_JOURNAL),
+        layer1_apply_allowed(daemon),
+    );
+}
+
 fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
     let owner_uid = user
         .checked_mul(100_000)
@@ -421,7 +454,7 @@ fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
                 daemon.would_stop += 1;
                 return;
             }
-            let packages = daemon.uid_map.packages_of(appid);
+            let packages: Vec<String> = daemon.uid_map.packages_of(appid).to_vec();
             if packages.is_empty() {
                 warn!("uid {owner_uid}: backgrounded but no package name; cannot force-stop");
                 return;
@@ -437,9 +470,23 @@ fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
                     "respawn guard: uid {owner_uid} hit {} kills in {} s; backing off to {backoff_grace} ms grace",
                     daemon.policy.respawn_max, daemon.policy.respawn_window_s
                 );
+                if layer1_apply_allowed(daemon) {
+                    let mut ops = layer1::AndroidOps;
+                    for package in &packages {
+                        layer1::reapply_package(
+                            &daemon.policy,
+                            &daemon.builtin_never_kill,
+                            &daemon.uid_map,
+                            &mut ops,
+                            Path::new(LAYER1_JOURNAL),
+                            true,
+                            package,
+                        );
+                    }
+                }
             }
             let mut stopped = false;
-            for package in packages {
+            for package in &packages {
                 if let Some(reason) = stop_reason() {
                     info!("stopping force-stop loop: {reason}");
                     break;
@@ -524,17 +571,33 @@ fn reload_policy(daemon: &mut Daemon, deny_map: &mut DenyMapMut<'_>) -> anyhow::
         .respawn
         .set_limits(policy.respawn_window_s, policy.respawn_max);
     daemon.policy = policy;
-    daemon.uid_map = UidMap::load(Path::new(PACKAGES_LIST)).unwrap_or_else(|err| {
-        warn!("uid map rebuild failed on policy reload: {err:#}");
-        UidMap::empty()
-    });
+    daemon.policy_ready = true;
+    match UidMap::load(Path::new(PACKAGES_LIST)) {
+        Ok(map) => {
+            daemon.uid_map = map;
+            daemon.uid_map_ready = true;
+        }
+        Err(err) => {
+            warn!("uid map rebuild failed on policy reload: {err:#}");
+            daemon.uid_map = UidMap::empty();
+            daemon.uid_map_ready = false;
+        }
+    }
     rebuild_deny(daemon, deny_map);
     info!("policy reloaded: {} deny entries", daemon.deny.len());
+    reconcile_layer1(daemon);
     Ok(())
 }
 
 fn run() -> anyhow::Result<()> {
     let cfg = parse_args()?;
+    if cfg.restore_layer1 {
+        let mut ops = layer1::AndroidOps;
+        layer1::restore_all(Path::new(LAYER1_JOURNAL), &mut ops)
+            .context("failed to restore Layer 1 state")?;
+        info!("Layer 1 state restored");
+        return Ok(());
+    }
 
     let btf_bytes =
         std::fs::read(&cfg.btf).with_context(|| format!("failed to read {}", cfg.btf.display()))?;
@@ -574,7 +637,9 @@ fn run() -> anyhow::Result<()> {
 
     let _ = std::fs::create_dir_all(REAPER_DIR);
 
-    let policy = match Policy::load(&cfg.policy) {
+    let policy_result = Policy::load(&cfg.policy);
+    let policy_ready = policy_result.is_ok();
+    let policy = match policy_result {
         Ok(policy) => policy,
         Err(err) => {
             error!(
@@ -584,10 +649,15 @@ fn run() -> anyhow::Result<()> {
             Policy::default()
         }
     };
-    let uid_map = UidMap::load(Path::new(PACKAGES_LIST)).unwrap_or_else(|err| {
-        warn!("failed to build uid map: {err:#}");
-        UidMap::empty()
-    });
+    let uid_map_result = UidMap::load(Path::new(PACKAGES_LIST));
+    let uid_map_ready = uid_map_result.is_ok();
+    let uid_map = match uid_map_result {
+        Ok(map) => map,
+        Err(err) => {
+            warn!("failed to build uid map: {err:#}");
+            UidMap::empty()
+        }
+    };
     let mut users = uid_map.users();
     if users.is_empty() {
         users.push(0);
@@ -623,10 +693,16 @@ fn run() -> anyhow::Result<()> {
         respawn,
         budget_reported: budget_tripped,
         armed,
+        policy_ready,
+        uid_map_ready,
         nominations: 0,
         would_stop: 0,
         stops: 0,
     };
+
+    if policy_ready && uid_map_ready {
+        reconcile_layer1(&daemon);
+    }
 
     // SAFETY: no preconditions; failure reported as -1 and checked.
     let inotify_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
@@ -801,6 +877,7 @@ fn run() -> anyhow::Result<()> {
                                         info!("armed; enforcing");
                                         sweep(&mut daemon);
                                         rearm_timer(timer_fd, daemon.pending.earliest())?;
+                                        reconcile_layer1(&daemon);
                                     } else if !armed && daemon.armed {
                                         daemon.armed = false;
                                         info!("disarmed");
@@ -823,9 +900,14 @@ fn run() -> anyhow::Result<()> {
                                     Ok(map) => {
                                         info!("uid map rebuilt: {} packages", map.package_count());
                                         daemon.uid_map = map;
+                                        daemon.uid_map_ready = true;
                                         rebuild_deny(&mut daemon, &mut deny_map);
+                                        reconcile_layer1(&daemon);
                                     }
-                                    Err(err) => error!("failed to rebuild uid map: {err:#}"),
+                                    Err(err) => {
+                                        error!("failed to rebuild uid map: {err:#}");
+                                        daemon.uid_map_ready = false;
+                                    }
                                 }
                             }
                             offset = name_start + len;
@@ -859,6 +941,7 @@ fn run() -> anyhow::Result<()> {
                                 info!("SIGUSR1: armed; enforcing");
                                 sweep(&mut daemon);
                                 rearm_timer(timer_fd, daemon.pending.earliest())?;
+                                reconcile_layer1(&daemon);
                             }
                             libc::SIGUSR2 => {
                                 info!(
