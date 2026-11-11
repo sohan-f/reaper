@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use anyhow::{Context, bail, ensure};
-use log::warn;
 use serde::Deserialize;
 
 pub const APPID_START: u32 = 10_000;
@@ -26,6 +25,19 @@ pub struct DenyRule {
     pub keep_adj: i16,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppOpSetting {
+    pub op: String,
+    pub mode: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Layer1Policy {
+    pub disable_boot_receivers: bool,
+    pub appops: Vec<AppOpSetting>,
+    pub standby_bucket: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Policy {
     pub mode: Mode,
@@ -36,6 +48,7 @@ pub struct Policy {
     pub respawn_max: u32,
     pub never_kill: Vec<String>,
     pub deny: Vec<DenyRule>,
+    pub layer1: Option<Layer1Policy>,
 }
 
 impl Default for Policy {
@@ -49,6 +62,7 @@ impl Default for Policy {
             respawn_max: 3,
             never_kill: Vec::new(),
             deny: Vec::new(),
+            layer1: None,
         }
     }
 }
@@ -80,11 +94,58 @@ struct RawNeverKill {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawLayer1 {
+    disable_boot_receivers: Option<bool>,
+    appops: Option<Vec<String>>,
+    standby_bucket: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPolicy {
     global: Option<RawGlobal>,
-    layer1: Option<toml::Value>,
+    layer1: Option<RawLayer1>,
     never_kill: Option<RawNeverKill>,
     deny: Option<Vec<RawDeny>>,
+}
+
+const APPOP_MODES: [&str; 4] = ["allow", "ignore", "deny", "default"];
+const STANDBY_BUCKETS: [&str; 5] = ["active", "working_set", "frequent", "rare", "restricted"];
+
+fn parse_layer1(raw: RawLayer1) -> anyhow::Result<Layer1Policy> {
+    let mut layer1 = Layer1Policy {
+        disable_boot_receivers: raw.disable_boot_receivers.unwrap_or(false),
+        ..Layer1Policy::default()
+    };
+    for entry in raw.appops.unwrap_or_default() {
+        let (op, mode) = entry
+            .split_once(':')
+            .with_context(|| format!("appop {entry:?} is not OP:MODE"))?;
+        ensure!(
+            !op.is_empty() && op.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "invalid appop name in {entry:?}"
+        );
+        ensure!(
+            APPOP_MODES.contains(&mode),
+            "unknown appop mode {mode:?} in {entry:?}"
+        );
+        ensure!(
+            !layer1.appops.iter().any(|setting| setting.op == op),
+            "duplicate appop {op:?}"
+        );
+        layer1.appops.push(AppOpSetting {
+            op: op.to_string(),
+            mode: mode.to_string(),
+        });
+    }
+    if let Some(bucket) = raw.standby_bucket {
+        ensure!(
+            STANDBY_BUCKETS.contains(&bucket.as_str()),
+            "unknown standby_bucket {bucket:?}"
+        );
+        layer1.standby_bucket = Some(bucket);
+    }
+    Ok(layer1)
 }
 
 fn valid_appid(uid: u32) -> bool {
@@ -130,8 +191,8 @@ impl Policy {
             }
         }
 
-        if raw.layer1.is_some() {
-            warn!("policy [layer1] settings are not applied");
+        if let Some(layer1) = raw.layer1 {
+            policy.layer1 = Some(parse_layer1(layer1)?);
         }
 
         for package in raw
@@ -223,6 +284,67 @@ keep_adj = 200
         assert_eq!(policy.deny[1].keep_adj, 200);
         assert_eq!(policy.deny[0].grace_ms, 2000);
         assert_eq!(policy.deny[0].keep_adj, 100);
+        let layer1 = policy.layer1.expect("layer1 table must parse");
+        assert!(layer1.disable_boot_receivers);
+        assert_eq!(
+            layer1.appops,
+            [
+                AppOpSetting {
+                    op: "RUN_ANY_IN_BACKGROUND".to_string(),
+                    mode: "ignore".to_string(),
+                },
+                AppOpSetting {
+                    op: "RUN_IN_BACKGROUND".to_string(),
+                    mode: "ignore".to_string(),
+                },
+            ]
+        );
+        assert_eq!(layer1.standby_bucket.as_deref(), Some("restricted"));
+    }
+
+    #[test]
+    fn layer1_absent_means_no_layer1() {
+        let policy = Policy::parse("[global]\nmode = \"observe\"\n").expect("policy must parse");
+        assert!(policy.layer1.is_none());
+    }
+
+    #[test]
+    fn empty_layer1_table_disables_every_category() {
+        let policy = Policy::parse("[layer1]\n").expect("policy must parse");
+        let layer1 = policy.layer1.expect("layer1 table must parse");
+        assert!(!layer1.disable_boot_receivers);
+        assert!(layer1.appops.is_empty());
+        assert!(layer1.standby_bucket.is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_layer1_key() {
+        assert!(Policy::parse("[layer1]\ndisable_receivers = true\n").is_err());
+    }
+
+    #[test]
+    fn rejects_bad_appop_mode() {
+        assert!(Policy::parse("[layer1]\nappops = [\"RUN_ANY_IN_BACKGROUND:always\"]\n").is_err());
+    }
+
+    #[test]
+    fn rejects_appop_without_mode() {
+        assert!(Policy::parse("[layer1]\nappops = [\"RUN_ANY_IN_BACKGROUND\"]\n").is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_appop() {
+        assert!(
+            Policy::parse(
+                "[layer1]\nappops = [\"RUN_IN_BACKGROUND:ignore\", \"RUN_IN_BACKGROUND:deny\"]\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_bad_standby_bucket() {
+        assert!(Policy::parse("[layer1]\nstandby_bucket = \"cold\"\n").is_err());
     }
 
     #[test]
