@@ -8,10 +8,17 @@ use anyhow::{Context, bail};
 
 use crate::policy::appid_of;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageInstance {
+    pub user: u32,
+    pub uid: u32,
+    pub appid: u32,
+}
+
 #[derive(Default)]
 pub struct UidMap {
     packages_by_appid: HashMap<u32, Vec<String>>,
-    uid_by_package: HashMap<String, u32>,
+    instances_by_package: HashMap<String, Vec<PackageInstance>>,
     user_ids: HashSet<u32>,
 }
 
@@ -27,8 +34,17 @@ impl UidMap {
             .unwrap_or(&[])
     }
 
+    pub fn instances_of(&self, package: &str) -> &[PackageInstance] {
+        self.instances_by_package
+            .get(package)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     pub fn uid_of(&self, package: &str) -> Option<u32> {
-        self.uid_by_package.get(package).copied()
+        self.instances_of(package)
+            .first()
+            .map(|instance| instance.uid)
     }
 
     pub fn appid_of_package(&self, package: &str) -> Option<u32> {
@@ -36,7 +52,7 @@ impl UidMap {
     }
 
     pub fn package_count(&self) -> usize {
-        self.uid_by_package.len()
+        self.instances_by_package.len()
     }
 
     /// Returns the user ids present in the map, sorted.
@@ -44,6 +60,22 @@ impl UidMap {
         let mut users: Vec<u32> = self.user_ids.iter().copied().collect();
         users.sort_unstable();
         users
+    }
+
+    fn insert(&mut self, package: &str, uid: u32, appid: u32) {
+        let user = uid / 100_000;
+        self.user_ids.insert(user);
+        let instances = self
+            .instances_by_package
+            .entry(package.to_string())
+            .or_default();
+        if !instances.iter().any(|instance| instance.uid == uid) {
+            instances.push(PackageInstance { user, uid, appid });
+        }
+        let packages = self.packages_by_appid.entry(appid).or_default();
+        if !packages.iter().any(|known| known == package) {
+            packages.push(package.to_string());
+        }
     }
 
     pub fn parse_packages_list(text: &str) -> Self {
@@ -60,12 +92,7 @@ impl UidMap {
                 continue;
             };
             let Some(appid) = appid_of(uid) else { continue };
-            map.user_ids.insert(uid / 100_000);
-            map.packages_by_appid
-                .entry(appid)
-                .or_default()
-                .push(package.to_string());
-            map.uid_by_package.insert(package.to_string(), uid);
+            map.insert(package, uid, appid);
         }
         map
     }
@@ -87,12 +114,7 @@ impl UidMap {
                 continue;
             };
             let Some(appid) = appid_of(uid) else { continue };
-            map.user_ids.insert(uid / 100_000);
-            map.packages_by_appid
-                .entry(appid)
-                .or_default()
-                .push(package.to_string());
-            map.uid_by_package.insert(package.to_string(), uid);
+            map.insert(package, uid, appid);
         }
         map
     }
@@ -155,5 +177,33 @@ mod tests {
         let text = "com.example 10123 0 /data\ncom.example 1010123 0 /data\n";
         let map = UidMap::parse_packages_list(text);
         assert_eq!(map.users(), vec![0, 10]);
+        assert_eq!(
+            map.instances_of("com.example"),
+            [
+                PackageInstance {
+                    user: 0,
+                    uid: 10123,
+                    appid: 10123,
+                },
+                PackageInstance {
+                    user: 10,
+                    uid: 1010123,
+                    appid: 10123,
+                },
+            ]
+        );
+        assert_eq!(map.packages_of(10123), &["com.example".to_string()]);
+        assert_eq!(map.package_count(), 1);
+    }
+
+    #[test]
+    fn shared_appid_keeps_every_package() {
+        let text = "com.example.one 10123 0 /data\ncom.example.two 10123 0 /data\n";
+        let map = UidMap::parse_packages_list(text);
+        let mut packages = map.packages_of(10123).to_vec();
+        packages.sort();
+        assert_eq!(packages, ["com.example.one", "com.example.two"]);
+        assert_eq!(map.instances_of("com.example.one").len(), 1);
+        assert_eq!(map.instances_of("com.example.two").len(), 1);
     }
 }
