@@ -132,6 +132,45 @@ pub fn reapply_package(
     }
 }
 
+/// Reapplies the configured standby bucket for one denied package and user.
+///
+/// The system re-buckets apps on its own, so a bucket set during reconcile
+/// drifts back within seconds. Call this when the app drops to the background,
+/// which is the event the bucket is meant to suppress.
+pub fn reapply_standby(
+    policy: &Policy,
+    builtin: &[String],
+    ops: &mut dyn Ops,
+    journal_path: &Path,
+    apply: bool,
+    user: u32,
+    package: &str,
+) {
+    if !apply {
+        return;
+    }
+    let Some(bucket) = policy
+        .layer1
+        .as_ref()
+        .and_then(|layer1| layer1.standby_bucket.as_ref())
+    else {
+        return;
+    };
+    if is_never_kill(policy, builtin, package)
+        || !policy.deny.iter().any(|rule| rule.package == package)
+    {
+        return;
+    }
+    let mut journal = match Journal::load(journal_path) {
+        Ok(journal) => journal,
+        Err(err) => {
+            error!("Layer 1 disabled: cannot read journal: {err:#}");
+            return;
+        }
+    };
+    apply_standby(user, package, bucket, &mut journal, ops);
+}
+
 /// Restores every journaled Layer 1 mutation.
 ///
 /// # Errors
@@ -613,8 +652,12 @@ mod tests {
             if self.fail_apply.contains(&call) {
                 anyhow::bail!("apply failed");
             }
-            self.buckets
-                .insert((user, package.to_string()), bucket.to_string());
+            // The device accepts a bucket name and prints the integer back.
+            let stored = match standby_bucket_id(bucket) {
+                Some(id) => id.to_string(),
+                None => bucket.to_string(),
+            };
+            self.buckets.insert((user, package.to_string()), stored);
             Ok(())
         }
     }
@@ -1139,6 +1182,26 @@ mod tests {
         reapply_package(&policy, &[], &map, &mut ops, &path, true, "com.example");
         assert!(ops.has_call("appop:0:com.example:RUN_IN_BACKGROUND:ignore"));
         assert_eq!(journal_items(&path).len(), 1);
+    }
+
+    #[test]
+    fn standby_is_reapplied_after_the_system_rebuckets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("journal.toml");
+        let map = uid_map("com.example 10123 0 /data\n");
+        let mut ops = FakeOps::default();
+        let policy = policy(&["com.example"], Some(layer1_all()), &[]);
+        reconcile_with(&policy, Some(&map), &mut ops, &path, true);
+        assert_eq!(ops.bucket(0, "com.example"), "45");
+
+        ops.buckets
+            .insert((0, "com.example".to_string()), "40".to_string());
+        reapply_standby(&policy, &[], &mut ops, &path, false, 0, "com.example");
+        assert_eq!(ops.bucket(0, "com.example"), "40");
+
+        reapply_standby(&policy, &[], &mut ops, &path, true, 0, "com.example");
+        assert_eq!(ops.bucket(0, "com.example"), "45");
+        assert_eq!(journal_items(&path).len(), 2);
     }
 
     #[test]

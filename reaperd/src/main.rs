@@ -435,6 +435,20 @@ fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
         }
         Decision::Background { min_adj } => {
             let now = boottime_ns();
+            if layer1_apply_allowed(daemon) {
+                let mut ops = layer1::AndroidOps;
+                for package in daemon.uid_map.packages_of(appid) {
+                    layer1::reapply_standby(
+                        &daemon.policy,
+                        &daemon.builtin_never_kill,
+                        &mut ops,
+                        Path::new(LAYER1_JOURNAL),
+                        true,
+                        user,
+                        package,
+                    );
+                }
+            }
             if daemon.policy.mode == Mode::Observe || daemon.budget.tripped() {
                 let packages: Vec<&str> = daemon
                     .uid_map
