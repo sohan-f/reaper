@@ -162,11 +162,16 @@ fn init_logging() {
         .unwrap_or(log::LevelFilter::Info);
 
     #[cfg(target_os = "android")]
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_max_level(level)
-            .with_tag("reaperd"),
-    );
+    {
+        android_logger::init_once(
+            android_logger::Config::default()
+                .with_max_level(level)
+                .with_tag("reaperd")
+                // With an explicit tag android_logger prefixes the message with
+                // the module path, so every line would repeat "reaperd".
+                .format(|f, record| write!(f, "{}", record.args())),
+        );
+    }
 
     #[cfg(not(target_os = "android"))]
     {
@@ -376,6 +381,18 @@ fn layer1_apply_allowed(daemon: &Daemon) -> bool {
         && daemon.policy.mode == Mode::Enforce
         && !daemon.budget.tripped()
         && stop_reason().is_none()
+}
+
+fn log_layer1_config(policy: &Policy) {
+    match policy.layer1.as_ref() {
+        Some(layer1) => info!(
+            "Layer 1 config: receivers={} appops={} standby={}",
+            layer1.disable_boot_receivers,
+            layer1.appops.len(),
+            layer1.standby_bucket.as_deref().unwrap_or("none")
+        ),
+        None => info!("Layer 1 config: none"),
+    }
 }
 
 fn reconcile_layer1(daemon: &Daemon) {
@@ -626,6 +643,7 @@ fn reload_policy(daemon: &mut Daemon, deny_map: &mut DenyMapMut<'_>) -> anyhow::
         .set_limits(policy.respawn_window_s, policy.respawn_max);
     daemon.policy = policy;
     daemon.policy_ready = true;
+    log_layer1_config(&daemon.policy);
     match UidMap::load(Path::new(PACKAGES_LIST)) {
         Ok(map) => {
             daemon.uid_map = map;
@@ -703,6 +721,7 @@ fn run() -> anyhow::Result<()> {
             Policy::default()
         }
     };
+    log_layer1_config(&policy);
     let uid_map_result = UidMap::load(Path::new(PACKAGES_LIST));
     let uid_map_ready = uid_map_result.is_ok();
     let uid_map = match uid_map_result {
