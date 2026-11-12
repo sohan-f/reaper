@@ -1421,6 +1421,33 @@ mod tests {
     }
 
     #[test]
+    fn restore_maps_every_journaled_component_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("journal.toml");
+        let mut journal = Journal::load(&path).expect("journal");
+        for (index, state) in ["disabled", "disabled-user", "disabled-until-used"]
+            .iter()
+            .enumerate()
+        {
+            let component = format!("com.example/.R{index}");
+            journal.append(Item::new(
+                0,
+                "com.example",
+                Kind::Receiver,
+                &component,
+                *state,
+            ));
+        }
+        journal.save().expect("save");
+
+        let mut ops = FakeOps::default();
+        restore_all(&path, &mut ops).expect("restore must succeed");
+        assert!(ops.has_call("restore-component:0:com.example/.R0:disabled"));
+        assert!(ops.has_call("restore-component:0:com.example/.R1:disabled-user"));
+        assert!(ops.has_call("restore-component:0:com.example/.R2:disabled-until-used"));
+    }
+
+    #[test]
     fn expired_deadline_leaves_the_device_untouched() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("journal.toml");
