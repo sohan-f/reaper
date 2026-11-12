@@ -110,7 +110,9 @@ struct RawPolicy {
 }
 
 const APPOP_MODES: [&str; 4] = ["allow", "ignore", "deny", "default"];
-const STANDBY_BUCKETS: [&str; 5] = ["active", "working_set", "frequent", "rare", "restricted"];
+// Only the ops verified on the target build; an unknown name must fail at parse
+// time instead of on every reconcile.
+const APPOP_NAMES: [&str; 2] = ["RUN_ANY_IN_BACKGROUND", "RUN_IN_BACKGROUND"];
 
 fn parse_layer1(raw: RawLayer1) -> anyhow::Result<Layer1Policy> {
     let mut layer1 = Layer1Policy {
@@ -122,8 +124,8 @@ fn parse_layer1(raw: RawLayer1) -> anyhow::Result<Layer1Policy> {
             .split_once(':')
             .with_context(|| format!("appop {entry:?} is not OP:MODE"))?;
         ensure!(
-            !op.is_empty() && op.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
-            "invalid appop name in {entry:?}"
+            APPOP_NAMES.contains(&op),
+            "unknown appop {op:?} in {entry:?}"
         );
         ensure!(
             APPOP_MODES.contains(&mode),
@@ -140,7 +142,7 @@ fn parse_layer1(raw: RawLayer1) -> anyhow::Result<Layer1Policy> {
     }
     if let Some(bucket) = raw.standby_bucket {
         ensure!(
-            STANDBY_BUCKETS.contains(&bucket.as_str()),
+            crate::layer1::standby_bucket_id(&bucket).is_some(),
             "unknown standby_bucket {bucket:?}"
         );
         layer1.standby_bucket = Some(bucket);
@@ -330,6 +332,11 @@ keep_adj = 200
     #[test]
     fn rejects_appop_without_mode() {
         assert!(Policy::parse("[layer1]\nappops = [\"RUN_ANY_IN_BACKGROUND\"]\n").is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_appop_name() {
+        assert!(Policy::parse("[layer1]\nappops = [\"RUN_IN_BACKGROND:ignore\"]\n").is_err());
     }
 
     #[test]
