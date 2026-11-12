@@ -565,6 +565,7 @@ fn sweep(daemon: &mut Daemon) {
 }
 
 fn rebuild_deny(daemon: &mut Daemon, deny_map: &mut DenyMapMut<'_>) {
+    refresh_never_kill(daemon);
     daemon.deny = build_deny(
         &daemon.policy,
         &daemon.builtin_never_kill,
@@ -576,6 +577,23 @@ fn rebuild_deny(daemon: &mut Daemon, deny_map: &mut DenyMapMut<'_>) {
     if let Err(err) = install_deny_map(deny_map, &daemon.deny) {
         error!("failed to update DENY map: {err:#}");
     }
+}
+
+fn refresh_never_kill(daemon: &mut Daemon) {
+    let mut users = daemon.uid_map.users();
+    if users.is_empty() {
+        users.push(0);
+    }
+    extend_never_kill(&mut daemon.builtin_never_kill, &users);
+}
+
+// A role lookup can fail while packages.list is being rewritten, so the set
+// only grows: dropping a launcher or dialer from a safety list would let
+// Layer 2 kill it.
+fn extend_never_kill(packages: &mut Vec<String>, users: &[u32]) {
+    packages.extend(never_kill::resolve(users));
+    packages.sort();
+    packages.dedup();
 }
 
 fn reload_policy(daemon: &mut Daemon, deny_map: &mut DenyMapMut<'_>) -> anyhow::Result<()> {
@@ -1024,6 +1042,24 @@ mod tests {
         let deny = build_deny(&policy, &[], &uid_map, &[]);
         assert_eq!(deny.len(), 1);
         assert_eq!(deny[0].appid, 10293);
+    }
+
+    #[test]
+    fn never_kill_set_only_grows() {
+        let mut packages = vec!["com.example.custom".to_string()];
+        extend_never_kill(&mut packages, &[]);
+        assert!(
+            packages
+                .iter()
+                .any(|package| package == "com.example.custom")
+        );
+        for package in never_kill::PACKAGES {
+            assert!(packages.iter().any(|entry| entry == package));
+        }
+        let len = packages.len();
+        extend_never_kill(&mut packages, &[]);
+        assert_eq!(packages.len(), len);
+        assert!(packages.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]
