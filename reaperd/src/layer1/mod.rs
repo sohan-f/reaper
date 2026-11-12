@@ -367,12 +367,14 @@ fn apply_receivers(
     let prefix = format!("{package}/");
     let mut components: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
+    let mut queried = 0usize;
     for action in ACTIONS {
         if deadline.expired() {
             return;
         }
         match ops.receivers(user, action) {
             Ok(found) => {
+                queried += found.len();
                 for component in found {
                     if component.starts_with(&prefix) && seen.insert(component.clone()) {
                         components.push(component);
@@ -387,7 +389,22 @@ fn apply_receivers(
         }
     }
     if components.is_empty() {
-        info!("Layer 1: no boot receivers for {package} user {user}");
+        let disabled = journal
+            .items()
+            .iter()
+            .filter(|item| {
+                item.user == user && item.package == package && item.kind == Kind::Receiver
+            })
+            .count();
+        if disabled > 0 {
+            info!(
+                "Layer 1: {disabled} boot receiver(s) for {package} user {user} already disabled"
+            );
+        } else {
+            info!(
+                "Layer 1: no boot receivers for {package} user {user}; queries returned {queried}"
+            );
+        }
         return;
     }
     let states = match ops.component_states(user, package) {
@@ -1155,6 +1172,42 @@ mod tests {
             .find(|item| item.kind == Kind::Receiver)
             .expect("receiver journaled");
         assert_eq!(item.previous, "enabled");
+    }
+
+    #[test]
+    fn disabled_receiver_is_kept_when_query_skips_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("journal.toml");
+        let map = uid_map("com.example 10123 0 /data\n");
+        let mut ops = FakeOps::default();
+        ops.receivers.insert(
+            (0, ACTIONS[0].to_string()),
+            vec!["com.example/.Boot".to_string()],
+        );
+        reconcile_with(
+            &policy(&["com.example"], Some(layer1_all()), &[]),
+            Some(&map),
+            &mut ops,
+            &path,
+            true,
+        );
+        assert_eq!(journal_items(&path).len(), 3);
+
+        // The system leaves a disabled component out of the receiver query.
+        ops.receivers.clear();
+        ops.calls.clear();
+        reconcile_with(
+            &policy(&["com.example"], Some(layer1_all()), &[]),
+            Some(&map),
+            &mut ops,
+            &path,
+            true,
+        );
+
+        let kinds: Vec<Kind> = journal_items(&path).iter().map(|item| item.kind).collect();
+        assert!(kinds.contains(&Kind::Receiver));
+        assert!(ops.calls.is_empty());
+        assert_eq!(ops.state(0, "com.example/.Boot"), ComponentState::Disabled);
     }
 
     #[test]
