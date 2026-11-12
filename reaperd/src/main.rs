@@ -71,6 +71,7 @@ struct Daemon {
     uid_map: UidMap,
     deny: Vec<DenyEntry>,
     builtin_never_kill: Vec<String>,
+    never_kill_users: Vec<u32>,
     budget: KillBudget,
     respawn: RespawnGuard,
     budget_reported: bool,
@@ -587,7 +588,25 @@ fn refresh_never_kill(daemon: &mut Daemon) {
     if users.is_empty() {
         users.push(0);
     }
-    extend_never_kill(&mut daemon.builtin_never_kill, &users);
+    refresh_never_kill_users(
+        &mut daemon.builtin_never_kill,
+        &mut daemon.never_kill_users,
+        &users,
+    );
+}
+
+fn refresh_never_kill_users(packages: &mut Vec<String>, resolved: &mut Vec<u32>, users: &[u32]) {
+    let fresh: Vec<u32> = users
+        .iter()
+        .copied()
+        .filter(|user| !resolved.contains(user))
+        .collect();
+    if fresh.is_empty() {
+        return;
+    }
+    extend_never_kill(packages, &fresh);
+    resolved.extend(fresh);
+    resolved.sort_unstable();
 }
 
 // A role lookup can fail while packages.list is being rewritten, so the set
@@ -724,6 +743,7 @@ fn run() -> anyhow::Result<()> {
         uid_map,
         deny,
         builtin_never_kill,
+        never_kill_users: users,
         budget,
         respawn,
         budget_reported: budget_tripped,
@@ -1045,6 +1065,15 @@ mod tests {
         let deny = build_deny(&policy, &[], &uid_map, &[]);
         assert_eq!(deny.len(), 1);
         assert_eq!(deny[0].appid, 10293);
+    }
+
+    #[test]
+    fn never_kill_refresh_skips_known_users() {
+        let mut packages = Vec::new();
+        let mut resolved = vec![0];
+        refresh_never_kill_users(&mut packages, &mut resolved, &[0]);
+        assert!(packages.is_empty());
+        assert_eq!(resolved, vec![0]);
     }
 
     #[test]
