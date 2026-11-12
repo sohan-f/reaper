@@ -56,8 +56,8 @@ pub fn desired_instances(
 ///
 /// `uid_map` is `None` when the package map could not be trusted. In that case
 /// reconciliation is skipped: an empty map would look like every package was
-/// uninstalled. `apply` is false in observe mode, while disarmed, or while a
-/// kill-switch marker is present; restore still runs.
+/// uninstalled. `apply` is false in observe mode, while disarmed, while the kill
+/// budget is tripped, or while a kill-switch marker is present; restore still runs.
 pub fn reconcile(
     policy: &Policy,
     builtin: &[String],

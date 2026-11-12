@@ -371,7 +371,10 @@ fn stop_reason() -> Option<&'static str> {
 }
 
 fn layer1_apply_allowed(daemon: &Daemon) -> bool {
-    daemon.armed && daemon.policy.mode == Mode::Enforce && stop_reason().is_none()
+    daemon.armed
+        && daemon.policy.mode == Mode::Enforce
+        && !daemon.budget.tripped()
+        && stop_reason().is_none()
 }
 
 fn reconcile_layer1(daemon: &Daemon) {
