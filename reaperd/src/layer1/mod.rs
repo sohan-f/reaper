@@ -387,6 +387,7 @@ fn apply_receivers(
         }
     }
     if components.is_empty() {
+        info!("Layer 1: no boot receivers for {package} user {user}");
         return;
     }
     let states = match ops.component_states(user, package) {
