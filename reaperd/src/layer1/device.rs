@@ -15,6 +15,11 @@ const PM: &str = "/system/bin/pm";
 const AM: &str = "/system/bin/am";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+// MATCH_DIRECT_BOOT_AWARE | MATCH_DIRECT_BOOT_UNAWARE. Without an explicit
+// opinion the query follows the user's lock state, and a locked user hides
+// every receiver that is not direct-boot aware.
+const RECEIVER_QUERY_FLAGS: &str = "786432";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentState {
     Default,
@@ -90,6 +95,8 @@ impl Ops for AndroidOps {
                 "--brief",
                 "--user",
                 &user,
+                "--query-flags",
+                RECEIVER_QUERY_FLAGS,
                 "-a",
                 action,
             ],
