@@ -411,8 +411,11 @@ fn apply_receivers(
             .find(user, package, Kind::Receiver, &component)
             .is_some()
         {
-            if let Err(err) = ops.disable_component(user, &component) {
-                warn!("Layer 1: reapply receiver {component} user {user} failed: {err:#}");
+            match ops.disable_component(user, &component) {
+                Ok(()) => info!("Layer 1: reapplied receiver {component} user {user}"),
+                Err(err) => {
+                    warn!("Layer 1: reapply receiver {component} user {user} failed: {err:#}");
+                }
             }
             continue;
         }
@@ -455,13 +458,19 @@ fn apply_appop(
         .find(user, package, Kind::Appop, &setting.op)
         .is_some()
     {
-        if current != setting.mode
-            && let Err(err) = ops.set_appop(user, package, &setting.op, &setting.mode)
-        {
-            warn!(
-                "Layer 1: reapply appop {} for {package} user {user} failed: {err:#}",
-                setting.op
-            );
+        if current != setting.mode {
+            match ops.set_appop(user, package, &setting.op, &setting.mode) {
+                Ok(()) => info!(
+                    "Layer 1: reapplied appop {} for {package} user {user}",
+                    setting.op
+                ),
+                Err(err) => {
+                    warn!(
+                        "Layer 1: reapply appop {} for {package} user {user} failed: {err:#}",
+                        setting.op
+                    );
+                }
+            }
         }
         return;
     }
@@ -520,10 +529,13 @@ fn apply_standby(
         .find(user, package, Kind::Standby, "bucket")
         .is_some()
     {
-        if current != expected.to_string()
-            && let Err(err) = ops.set_standby_bucket(user, package, bucket)
-        {
-            warn!("Layer 1: reapply standby for {package} user {user} failed: {err:#}");
+        if current != expected.to_string() {
+            match ops.set_standby_bucket(user, package, bucket) {
+                Ok(()) => info!("Layer 1: reapplied standby for {package} user {user}"),
+                Err(err) => {
+                    warn!("Layer 1: reapply standby for {package} user {user} failed: {err:#}");
+                }
+            }
         }
         return;
     }
