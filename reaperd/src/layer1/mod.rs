@@ -17,8 +17,8 @@ use crate::{
     uidmap::UidMap,
 };
 
-use device::ComponentState;
 pub use device::{AndroidOps, Ops, standby_bucket_id};
+use device::{ComponentState, RestoreOutcome};
 use journal::{Item, Journal, Kind};
 
 const ACTIONS: [&str; 4] = [
@@ -450,12 +450,21 @@ fn restore_item(journal: &mut Journal, ops: &mut dyn Ops, item: &Item) -> bool {
                 return false;
             }
         },
-        Kind::Appop => ops.set_appop(item.user, &item.package, &item.key, &item.previous),
-        Kind::Standby => ops.set_standby_bucket(item.user, &item.package, &item.previous),
+        Kind::Appop => ops
+            .set_appop(item.user, &item.package, &item.key, &item.previous)
+            .map(|()| RestoreOutcome::Restored),
+        Kind::Standby => ops
+            .set_standby_bucket(item.user, &item.package, &item.previous)
+            .map(|()| RestoreOutcome::Restored),
     };
     match result {
-        Ok(()) => {
-            if item.kind == Kind::Standby {
+        Ok(outcome) => {
+            if outcome == RestoreOutcome::UnknownComponent {
+                info!(
+                    "Layer 1: dropping receiver {} for {} user {}: component no longer exists",
+                    item.key, item.package, item.user
+                );
+            } else if item.kind == Kind::Standby {
                 match ops.standby_bucket(item.user, &item.package) {
                     Ok(observed) => info!(
                         "Layer 1: restored standby for {} user {}; observed bucket {observed}",
@@ -523,6 +532,7 @@ mod tests {
         fail_appop_query: HashSet<(u32, String, String)>,
         fail_apply: HashSet<String>,
         fail_restore: HashSet<String>,
+        missing_components: HashSet<(u32, String)>,
     }
 
     impl FakeOps {
@@ -612,14 +622,20 @@ mod tests {
             user: u32,
             component: &str,
             state: ComponentState,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<RestoreOutcome> {
             let call = format!("restore-component:{user}:{component}:{}", state.as_str());
             self.call(call.clone());
+            if self
+                .missing_components
+                .contains(&(user, component.to_string()))
+            {
+                return Ok(RestoreOutcome::UnknownComponent);
+            }
             if self.fail_restore.contains(&call) {
                 anyhow::bail!("restore failed");
             }
             self.set_state(user, component, state);
-            Ok(())
+            Ok(RestoreOutcome::Restored)
         }
 
         fn set_appop(
@@ -1026,6 +1042,37 @@ mod tests {
         let items = journal_items(&path);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, Kind::Appop);
+    }
+
+    #[test]
+    fn removed_component_is_dropped_without_a_restore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("journal.toml");
+        let map = uid_map("com.example 10123 0 /data\n");
+        let mut ops = FakeOps::default();
+        ops.receivers.insert(
+            (0, ACTIONS[0].to_string()),
+            vec!["com.example/.Boot".to_string()],
+        );
+        reconcile_with(
+            &policy(&["com.example"], Some(layer1_all()), &[]),
+            Some(&map),
+            &mut ops,
+            &path,
+            true,
+        );
+        assert_eq!(journal_items(&path).len(), 3);
+
+        ops.missing_components
+            .insert((0, "com.example/.Boot".to_string()));
+        reconcile_with(
+            &policy(&[], Some(layer1_all()), &[]),
+            Some(&map),
+            &mut ops,
+            &path,
+            true,
+        );
+        assert!(journal_items(&path).is_empty());
     }
 
     #[test]

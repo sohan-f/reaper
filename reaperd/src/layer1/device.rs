@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, ensure};
+use anyhow::{Context, bail, ensure};
 
 use crate::command;
 
@@ -66,9 +66,15 @@ pub trait Ops {
         user: u32,
         component: &str,
         state: ComponentState,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<RestoreOutcome>;
     fn set_appop(&mut self, user: u32, package: &str, op: &str, mode: &str) -> anyhow::Result<()>;
     fn set_standby_bucket(&mut self, user: u32, package: &str, bucket: &str) -> anyhow::Result<()>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    Restored,
+    UnknownComponent,
 }
 
 pub struct AndroidOps;
@@ -122,7 +128,7 @@ impl Ops for AndroidOps {
         user: u32,
         component: &str,
         state: ComponentState,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<RestoreOutcome> {
         let user = user.to_string();
         let action = match state {
             ComponentState::Default => "default-state",
@@ -130,7 +136,25 @@ impl Ops for AndroidOps {
             ComponentState::Disabled | ComponentState::DisabledUser => "disable-user",
             ComponentState::DisabledUntilUsed => "disable-until-used",
         };
-        run(PM, &[action, "--user", &user, component]).map(|_| ())
+        let output = run_output(PM, &[action, "--user", &user, component])?;
+        if output.status.success() {
+            return Ok(RestoreOutcome::Restored);
+        }
+        let message = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        // pm reports a component dropped from the manifest as
+        // IllegalArgumentException("Unknown component: ..."); nothing is left to restore.
+        if message.contains("Unknown component") {
+            return Ok(RestoreOutcome::UnknownComponent);
+        }
+        bail!(
+            "{PM} {action} --user {user} {component} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
 
     fn set_appop(&mut self, user: u32, package: &str, op: &str, mode: &str) -> anyhow::Result<()> {
@@ -149,10 +173,7 @@ impl Ops for AndroidOps {
 }
 
 fn run(program: &str, args: &[&str]) -> anyhow::Result<String> {
-    let mut command = Command::new(program);
-    command.args(args);
-    let output = command::output(&mut command, TIMEOUT)
-        .with_context(|| format!("failed to run {program} {}", args.join(" ")))?;
+    let output = run_output(program, args)?;
     ensure!(
         output.status.success(),
         "{program} {} exited with {}: {}",
@@ -161,6 +182,13 @@ fn run(program: &str, args: &[&str]) -> anyhow::Result<String> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn run_output(program: &str, args: &[&str]) -> anyhow::Result<std::process::Output> {
+    let mut command = Command::new(program);
+    command.args(args);
+    command::output(&mut command, TIMEOUT)
+        .with_context(|| format!("failed to run {program} {}", args.join(" ")))
 }
 
 pub fn parse_receivers(text: &str) -> Vec<String> {
