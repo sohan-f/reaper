@@ -3,10 +3,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 
-use crate::policy::appid_of;
+use crate::{command, policy::appid_of};
+
+const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageInstance {
@@ -131,9 +134,9 @@ impl UidMap {
                     "{} unreadable ({fs_err}); falling back to `cmd package list packages -U`",
                     path.display()
                 );
-                let output = Command::new("cmd")
-                    .args(["package", "list", "packages", "-U"])
-                    .output()
+                let mut command = Command::new("cmd");
+                command.args(["package", "list", "packages", "-U"]);
+                let output = command::output(&mut command, LIST_TIMEOUT)
                     .context("failed to run `cmd package list packages -U`")?;
                 if !output.status.success() {
                     bail!(
