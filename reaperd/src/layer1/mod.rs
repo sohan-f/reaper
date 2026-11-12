@@ -1373,6 +1373,54 @@ mod tests {
     }
 
     #[test]
+    fn restore_all_reverts_every_journaled_item() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("journal.toml");
+        let map = uid_map("com.example 10123 0 /data\n");
+        let mut ops = FakeOps::default();
+        ops.receivers.insert(
+            (0, ACTIONS[0].to_string()),
+            vec!["com.example/.Boot".to_string()],
+        );
+        reconcile_with(
+            &policy(&["com.example"], Some(layer1_all()), &[]),
+            Some(&map),
+            &mut ops,
+            &path,
+            true,
+        );
+        assert_eq!(journal_items(&path).len(), 3);
+        assert!(ops.has_call("disable:0:com.example/.Boot"));
+
+        restore_all(&path, &mut ops).expect("restore must succeed");
+        assert!(journal_items(&path).is_empty());
+        assert!(ops.has_call("restore-component:0:com.example/.Boot:default"));
+        assert!(ops.has_call("appop:0:com.example:RUN_IN_BACKGROUND:default"));
+        assert!(ops.has_call("standby:0:com.example:10"));
+    }
+
+    #[test]
+    fn restore_all_keeps_items_that_fail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("journal.toml");
+        let map = uid_map("com.example 10123 0 /data\n");
+        let mut ops = FakeOps::default();
+        reconcile_with(
+            &policy(&["com.example"], Some(layer1_appops()), &[]),
+            Some(&map),
+            &mut ops,
+            &path,
+            true,
+        );
+        ops.fail_apply
+            .insert("appop:0:com.example:RUN_IN_BACKGROUND:default".to_string());
+
+        let err = restore_all(&path, &mut ops).expect_err("restore must fail");
+        assert!(err.to_string().contains("could not be restored"));
+        assert_eq!(journal_items(&path).len(), 1);
+    }
+
+    #[test]
     fn expired_deadline_leaves_the_device_untouched() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("journal.toml");
