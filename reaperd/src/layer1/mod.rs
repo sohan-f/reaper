@@ -21,7 +21,7 @@ use crate::{
     uidmap::UidMap,
 };
 
-pub use device::{AndroidOps, Ops, standby_bucket_id};
+pub use device::{AndroidOps, Ops, ReceiverFilter, standby_bucket_id};
 use device::{ComponentState, RestoreOutcome};
 use journal::{Item, Journal, Kind};
 
@@ -372,7 +372,7 @@ fn apply_receivers(
         if deadline.expired() {
             return;
         }
-        match ops.receivers(user, action) {
+        match ops.receivers(user, action, ReceiverFilter::Enabled) {
             Ok(found) => {
                 queried += found.len();
                 for component in found {
@@ -400,9 +400,34 @@ fn apply_receivers(
             info!(
                 "Layer 1: {disabled} boot receiver(s) for {package} user {user} already disabled"
             );
-        } else {
+            return;
+        }
+        let mut hidden = HashSet::new();
+        for action in ACTIONS {
+            if deadline.expired() {
+                break;
+            }
+            match ops.receivers(user, action, ReceiverFilter::IncludingDisabled) {
+                Ok(found) => hidden.extend(
+                    found
+                        .into_iter()
+                        .filter(|component| component.starts_with(&prefix)),
+                ),
+                Err(err) => {
+                    warn!(
+                        "Layer 1: disabled receiver query for {package} user {user} action {action} failed: {err:#}"
+                    );
+                }
+            }
+        }
+        if hidden.is_empty() {
             info!(
                 "Layer 1: no boot receivers for {package} user {user}; queries returned {queried}"
+            );
+        } else {
+            info!(
+                "Layer 1: {} boot receiver(s) for {package} user {user} already disabled, not journaled",
+                hidden.len()
             );
         }
         return;
@@ -671,6 +696,7 @@ mod tests {
     #[derive(Default)]
     struct FakeOps {
         receivers: HashMap<(u32, String), Vec<String>>,
+        hidden_receivers: HashMap<(u32, String), Vec<String>>,
         states: HashMap<(u32, String), ComponentState>,
         appops: HashMap<(u32, String, String), String>,
         buckets: HashMap<(u32, String), String>,
@@ -718,12 +744,26 @@ mod tests {
     }
 
     impl Ops for FakeOps {
-        fn receivers(&mut self, user: u32, action: &str) -> anyhow::Result<Vec<String>> {
-            Ok(self
+        fn receivers(
+            &mut self,
+            user: u32,
+            action: &str,
+            filter: ReceiverFilter,
+        ) -> anyhow::Result<Vec<String>> {
+            let mut found = self
                 .receivers
                 .get(&(user, action.to_string()))
                 .cloned()
-                .unwrap_or_default())
+                .unwrap_or_default();
+            if filter == ReceiverFilter::IncludingDisabled {
+                found.extend(
+                    self.hidden_receivers
+                        .get(&(user, action.to_string()))
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
+            Ok(found)
         }
 
         fn component_states(
@@ -1208,6 +1248,30 @@ mod tests {
         assert!(kinds.contains(&Kind::Receiver));
         assert!(ops.calls.is_empty());
         assert_eq!(ops.state(0, "com.example/.Boot"), ComponentState::Disabled);
+    }
+
+    #[test]
+    fn externally_disabled_receiver_is_not_adopted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("journal.toml");
+        let map = uid_map("com.example 10123 0 /data\n");
+        let mut ops = FakeOps::default();
+        ops.hidden_receivers.insert(
+            (0, ACTIONS[0].to_string()),
+            vec!["com.example/.Boot".to_string()],
+        );
+
+        reconcile_with(
+            &policy(&["com.example"], Some(layer1_all()), &[]),
+            Some(&map),
+            &mut ops,
+            &path,
+            true,
+        );
+
+        let kinds: Vec<Kind> = journal_items(&path).iter().map(|item| item.kind).collect();
+        assert!(!kinds.contains(&Kind::Receiver));
+        assert!(!ops.has_call("disable:"));
     }
 
     #[test]

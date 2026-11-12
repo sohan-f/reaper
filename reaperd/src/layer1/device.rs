@@ -18,7 +18,19 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 // MATCH_DIRECT_BOOT_AWARE | MATCH_DIRECT_BOOT_UNAWARE. Without an explicit
 // opinion the query follows the user's lock state, and a locked user hides
 // every receiver that is not direct-boot aware.
-const RECEIVER_QUERY_FLAGS: &str = "786432";
+const MATCH_DIRECT_BOOT: u32 = 0x000C_0000;
+// MATCH_DISABLED_COMPONENTS. A disabled component is otherwise left out of
+// the result, so an already-suppressed receiver looks like an absent one.
+const MATCH_DISABLED_COMPONENTS: u32 = 0x0000_0200;
+
+/// Which components `query-receivers` returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiverFilter {
+    /// Enabled components only, the default of the shell command.
+    Enabled,
+    /// Every component, including the ones the enabled-state checks hide.
+    IncludingDisabled,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentState {
@@ -57,7 +69,12 @@ impl ComponentState {
 }
 
 pub trait Ops {
-    fn receivers(&mut self, user: u32, action: &str) -> anyhow::Result<Vec<String>>;
+    fn receivers(
+        &mut self,
+        user: u32,
+        action: &str,
+        filter: ReceiverFilter,
+    ) -> anyhow::Result<Vec<String>>;
     fn component_states(
         &mut self,
         user: u32,
@@ -85,8 +102,18 @@ pub enum RestoreOutcome {
 pub struct AndroidOps;
 
 impl Ops for AndroidOps {
-    fn receivers(&mut self, user: u32, action: &str) -> anyhow::Result<Vec<String>> {
+    fn receivers(
+        &mut self,
+        user: u32,
+        action: &str,
+        filter: ReceiverFilter,
+    ) -> anyhow::Result<Vec<String>> {
         let user = user.to_string();
+        let flags = match filter {
+            ReceiverFilter::Enabled => MATCH_DIRECT_BOOT,
+            ReceiverFilter::IncludingDisabled => MATCH_DIRECT_BOOT | MATCH_DISABLED_COMPONENTS,
+        }
+        .to_string();
         let output = run(
             CMD,
             &[
@@ -96,7 +123,7 @@ impl Ops for AndroidOps {
                 "--user",
                 &user,
                 "--query-flags",
-                RECEIVER_QUERY_FLAGS,
+                &flags,
                 "-a",
                 action,
             ],
