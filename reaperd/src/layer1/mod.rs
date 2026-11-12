@@ -391,20 +391,27 @@ fn apply_receivers(
         return;
     }
     let states = match ops.component_states(user, package) {
-        Ok(states) => states,
+        Ok(states) => Some(states),
         Err(err) => {
-            warn!("Layer 1: component state query for {package} user {user} failed: {err:#}");
-            return;
+            warn!(
+                "Layer 1: component state query for {package} user {user} failed: {err:#}; assuming enabled"
+            );
+            None
         }
     };
     for component in components {
         if deadline.expired() {
             return;
         }
-        let previous = states
-            .get(&device::component_key(&component))
-            .copied()
-            .unwrap_or(ComponentState::Default);
+        let previous = match &states {
+            Some(states) => states
+                .get(&device::component_key(&component))
+                .copied()
+                .unwrap_or(ComponentState::Default),
+            // The query returns enabled components only, so `enabled` restores
+            // the behavior that was replaced even without the exact prior state.
+            None => ComponentState::Enabled,
+        };
         if previous.is_disabled() {
             continue;
         }
@@ -652,6 +659,7 @@ mod tests {
         buckets: HashMap<(u32, String), String>,
         calls: Vec<String>,
         fail_appop_query: HashSet<(u32, String, String)>,
+        fail_state_query: HashSet<(u32, String)>,
         fail_apply: HashSet<String>,
         fail_restore: HashSet<String>,
         missing_components: HashSet<(u32, String)>,
@@ -706,6 +714,9 @@ mod tests {
             user: u32,
             package: &str,
         ) -> anyhow::Result<HashMap<String, ComponentState>> {
+            if self.fail_state_query.contains(&(user, package.to_string())) {
+                anyhow::bail!("query failed");
+            }
             let prefix = format!("{package}/");
             Ok(self
                 .states
@@ -1116,6 +1127,34 @@ mod tests {
         );
         assert!(journal_items(&path).is_empty());
         assert!(ops.calls.is_empty());
+    }
+
+    #[test]
+    fn failed_state_query_still_disables_receiver() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("journal.toml");
+        let map = uid_map("com.example 10123 0 /data\n");
+        let mut ops = FakeOps::default();
+        ops.receivers.insert(
+            (0, ACTIONS[0].to_string()),
+            vec!["com.example/.Boot".to_string()],
+        );
+        ops.fail_state_query.insert((0, "com.example".to_string()));
+
+        reconcile_with(
+            &policy(&["com.example"], Some(layer1_all()), &[]),
+            Some(&map),
+            &mut ops,
+            &path,
+            true,
+        );
+
+        assert_eq!(ops.state(0, "com.example/.Boot"), ComponentState::Disabled);
+        let item = journal_items(&path)
+            .into_iter()
+            .find(|item| item.kind == Kind::Receiver)
+            .expect("receiver journaled");
+        assert_eq!(item.previous, "enabled");
     }
 
     #[test]
