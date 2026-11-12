@@ -7,7 +7,11 @@
 mod device;
 mod journal;
 
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use anyhow::ensure;
 use log::{error, info, warn};
@@ -27,6 +31,36 @@ const ACTIONS: [&str; 4] = [
     "android.intent.action.QUICKBOOT_POWERON",
     "android.intent.action.MY_PACKAGE_REPLACED",
 ];
+
+// Reconcile runs on the epoll loop, and each command can block for its own
+// timeout. Without a pass-level bound a stalled system_server multiplies that
+// timeout by the number of packages and freezes event handling.
+const RECONCILE_BUDGET: Duration = Duration::from_secs(10);
+
+struct Deadline {
+    at: Instant,
+    announced: bool,
+}
+
+impl Deadline {
+    fn new() -> Self {
+        Self {
+            at: Instant::now() + RECONCILE_BUDGET,
+            announced: false,
+        }
+    }
+
+    fn expired(&mut self) -> bool {
+        if Instant::now() < self.at {
+            return false;
+        }
+        if !self.announced {
+            self.announced = true;
+            warn!("Layer 1: reconcile budget exhausted; deferring remaining work");
+        }
+        true
+    }
+}
 
 fn is_never_kill(policy: &Policy, builtin: &[String], package: &str) -> bool {
     policy.never_kill.iter().any(|p| p == package) || builtin.iter().any(|p| p == package)
@@ -78,6 +112,26 @@ pub fn reconcile(
         }
     };
 
+    reconcile_with_deadline(
+        policy,
+        builtin,
+        uid_map,
+        &mut journal,
+        ops,
+        apply,
+        &mut Deadline::new(),
+    );
+}
+
+fn reconcile_with_deadline(
+    policy: &Policy,
+    builtin: &[String],
+    uid_map: &UidMap,
+    journal: &mut Journal,
+    ops: &mut dyn Ops,
+    apply: bool,
+    deadline: &mut Deadline,
+) {
     let denied: HashSet<&str> = policy
         .deny
         .iter()
@@ -85,8 +139,8 @@ pub fn reconcile(
         .map(|rule| rule.package.as_str())
         .collect();
 
-    restore_removed(&mut journal, &denied, uid_map, ops);
-    restore_disabled_categories(&mut journal, policy.layer1.as_ref(), ops);
+    restore_removed(journal, &denied, uid_map, ops, deadline);
+    restore_disabled_categories(journal, policy.layer1.as_ref(), ops, deadline);
 
     if !apply {
         return;
@@ -95,7 +149,10 @@ pub fn reconcile(
         return;
     };
     for (user, package) in desired_instances(policy, builtin, uid_map) {
-        apply_instance(layer1, user, &package, &mut journal, ops);
+        if deadline.expired() {
+            return;
+        }
+        apply_instance(layer1, user, &package, journal, ops, deadline);
     }
 }
 
@@ -127,8 +184,19 @@ pub fn reapply_package(
             return;
         }
     };
+    let mut deadline = Deadline::new();
     for instance in uid_map.instances_of(package) {
-        apply_instance(layer1, instance.user, package, &mut journal, ops);
+        if deadline.expired() {
+            return;
+        }
+        apply_instance(
+            layer1,
+            instance.user,
+            package,
+            &mut journal,
+            ops,
+            &mut deadline,
+        );
     }
 }
 
@@ -168,7 +236,14 @@ pub fn reapply_standby(
             return;
         }
     };
-    apply_standby(user, package, bucket, &mut journal, ops);
+    apply_standby(
+        user,
+        package,
+        bucket,
+        &mut journal,
+        ops,
+        &mut Deadline::new(),
+    );
 }
 
 /// Restores every journaled Layer 1 mutation.
@@ -198,6 +273,7 @@ fn restore_removed(
     denied: &HashSet<&str>,
     uid_map: &UidMap,
     ops: &mut dyn Ops,
+    deadline: &mut Deadline,
 ) {
     let packages: HashSet<String> = journal
         .items()
@@ -225,6 +301,9 @@ fn restore_removed(
             .cloned()
             .collect();
         for item in stale {
+            if deadline.expired() {
+                return;
+            }
             restore_item(journal, ops, &item);
         }
     }
@@ -234,6 +313,7 @@ fn restore_disabled_categories(
     journal: &mut Journal,
     layer1: Option<&Layer1Policy>,
     ops: &mut dyn Ops,
+    deadline: &mut Deadline,
 ) {
     let stale: Vec<Item> = journal
         .items()
@@ -248,6 +328,9 @@ fn restore_disabled_categories(
         .cloned()
         .collect();
     for item in stale {
+        if deadline.expired() {
+            return;
+        }
         restore_item(journal, ops, &item);
     }
 }
@@ -258,23 +341,36 @@ fn apply_instance(
     package: &str,
     journal: &mut Journal,
     ops: &mut dyn Ops,
+    deadline: &mut Deadline,
 ) {
     if layer1.disable_boot_receivers {
-        apply_receivers(user, package, journal, ops);
+        apply_receivers(user, package, journal, ops, deadline);
     }
     for setting in &layer1.appops {
+        if deadline.expired() {
+            return;
+        }
         apply_appop(user, package, setting, journal, ops);
     }
     if let Some(bucket) = &layer1.standby_bucket {
-        apply_standby(user, package, bucket, journal, ops);
+        apply_standby(user, package, bucket, journal, ops, deadline);
     }
 }
 
-fn apply_receivers(user: u32, package: &str, journal: &mut Journal, ops: &mut dyn Ops) {
+fn apply_receivers(
+    user: u32,
+    package: &str,
+    journal: &mut Journal,
+    ops: &mut dyn Ops,
+    deadline: &mut Deadline,
+) {
     let prefix = format!("{package}/");
     let mut components: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
     for action in ACTIONS {
+        if deadline.expired() {
+            return;
+        }
         match ops.receivers(user, action) {
             Ok(found) => {
                 for component in found {
@@ -301,6 +397,9 @@ fn apply_receivers(user: u32, package: &str, journal: &mut Journal, ops: &mut dy
         }
     };
     for component in components {
+        if deadline.expired() {
+            return;
+        }
         let previous = states
             .get(&device::component_key(&component))
             .copied()
@@ -395,7 +494,17 @@ fn apply_appop(
     }
 }
 
-fn apply_standby(user: u32, package: &str, bucket: &str, journal: &mut Journal, ops: &mut dyn Ops) {
+fn apply_standby(
+    user: u32,
+    package: &str,
+    bucket: &str,
+    journal: &mut Journal,
+    ops: &mut dyn Ops,
+    deadline: &mut Deadline,
+) {
+    if deadline.expired() {
+        return;
+    }
     let Some(expected) = standby_bucket_id(bucket) else {
         error!("Layer 1: unknown standby bucket {bucket:?}");
         return;
@@ -1249,6 +1358,31 @@ mod tests {
         reapply_standby(&policy, &[], &mut ops, &path, true, 0, "com.example");
         assert_eq!(ops.bucket(0, "com.example"), "45");
         assert_eq!(journal_items(&path).len(), 2);
+    }
+
+    #[test]
+    fn expired_deadline_leaves_the_device_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("journal.toml");
+        let map = uid_map("com.example 10123 0 /data\n");
+        let mut ops = FakeOps::default();
+        let policy = policy(&["com.example"], Some(layer1_all()), &[]);
+        let mut journal = Journal::load(&path).expect("journal");
+        let mut deadline = Deadline {
+            at: Instant::now() - Duration::from_secs(1),
+            announced: true,
+        };
+        reconcile_with_deadline(
+            &policy,
+            &[],
+            &map,
+            &mut journal,
+            &mut ops,
+            true,
+            &mut deadline,
+        );
+        assert!(ops.calls.is_empty());
+        assert!(journal.items().is_empty());
     }
 
     #[test]
