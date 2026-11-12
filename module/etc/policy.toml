@@ -7,6 +7,8 @@ respawn_window_s = 60
 respawn_max = 3
 
 [layer1]
+# observe mode stops new mutations but leaves applied ones in place; they are
+# restored when the package leaves [[deny]] or the category is turned off.
 disable_boot_receivers = true
 appops = ["RUN_ANY_IN_BACKGROUND:ignore", "RUN_IN_BACKGROUND:ignore"]
 standby_bucket = "restricted"
