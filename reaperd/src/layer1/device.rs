@@ -255,6 +255,26 @@ pub fn parse_component_states(
     states
 }
 
+/// Canonical `package/fully.qualified.Class` form of a component name.
+///
+/// `query-receivers --brief` prints `pkg/.Class`, while dumpsys stores the
+/// fully qualified class name alone. Both spellings must produce the same key,
+/// otherwise the state lookup misses and a user's own disable is overwritten
+/// with `pm default-state` on restore.
+pub fn component_key(component: &str) -> String {
+    let Some((package, class)) = component.split_once('/') else {
+        return component.to_string();
+    };
+    let class = if let Some(relative) = class.strip_prefix('.') {
+        format!("{package}.{relative}")
+    } else if class.contains('.') {
+        class.to_string()
+    } else {
+        format!("{package}.{class}")
+    };
+    format!("{package}/{class}")
+}
+
 fn insert_component(
     states: &mut HashMap<String, ComponentState>,
     component: &str,
@@ -266,6 +286,7 @@ fn insert_component(
     } else {
         format!("{package}/{component}")
     };
+    let component = component_key(&component);
     let entry = states.entry(component).or_insert(state);
     if state == ComponentState::Disabled {
         *entry = state;
@@ -370,21 +391,21 @@ Packages:
 ";
         let user0 = parse_component_states(text, 0, "com.example");
         assert_eq!(
-            user0.get("com.example/.Boot"),
+            user0.get(&component_key("com.example/.Boot")),
             Some(&ComponentState::Disabled)
         );
         assert_eq!(
-            user0.get("com.example/.Enabled"),
+            user0.get(&component_key("com.example/.Enabled")),
             Some(&ComponentState::Enabled)
         );
-        assert_eq!(user0.get("com.example/.Missing"), None);
+        assert_eq!(user0.get(&component_key("com.example/.Missing")), None);
 
         let user10 = parse_component_states(text, 10, "com.example");
         assert_eq!(
-            user10.get("com.example/.Other"),
+            user10.get(&component_key("com.example/.Other")),
             Some(&ComponentState::Disabled)
         );
-        assert_eq!(user10.get("com.example/.Boot"), None);
+        assert_eq!(user10.get(&component_key("com.example/.Boot")), None);
     }
 
     #[test]
@@ -392,11 +413,11 @@ Packages:
         let text = "  User 0: enabled=0\n    disabledComponents: .One,com.example.Two\n";
         let states = parse_component_states(text, 0, "com.example");
         assert_eq!(
-            states.get("com.example/.One"),
+            states.get(&component_key("com.example/.One")),
             Some(&ComponentState::Disabled)
         );
         assert_eq!(
-            states.get("com.example/com.example.Two"),
+            states.get(&component_key("com.example/com.example.Two")),
             Some(&ComponentState::Disabled)
         );
     }
@@ -412,13 +433,26 @@ Packages:
 ";
         let states = parse_component_states(text, 0, "com.example");
         assert_eq!(
-            states.get("com.example/com.example.BootReceiver"),
+            states.get(&component_key("com.example/com.example.BootReceiver")),
             Some(&ComponentState::Disabled)
         );
         assert_eq!(
-            states.get("com.example/.EnabledReceiver"),
+            states.get(&component_key("com.example/.EnabledReceiver")),
             Some(&ComponentState::Enabled)
         );
+    }
+
+    #[test]
+    fn receiver_keys_match_every_component_spelling() {
+        let expected = component_key("com.example/.BootReceiver");
+        for spelling in [
+            "com.example/.BootReceiver",
+            "com.example/com.example.BootReceiver",
+            "com.example/BootReceiver",
+        ] {
+            assert_eq!(component_key(spelling), expected, "{spelling}");
+        }
+        assert_eq!(expected, "com.example/com.example.BootReceiver");
     }
 
     #[test]

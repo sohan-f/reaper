@@ -302,7 +302,7 @@ fn apply_receivers(user: u32, package: &str, journal: &mut Journal, ops: &mut dy
     };
     for component in components {
         let previous = states
-            .get(&component)
+            .get(&device::component_key(&component))
             .copied()
             .unwrap_or(ComponentState::Default);
         if previous.is_disabled() {
@@ -589,7 +589,7 @@ mod tests {
                 .states
                 .iter()
                 .filter(|((u, component), _)| *u == user && component.starts_with(&prefix))
-                .map(|((_, component), state)| (component.clone(), *state))
+                .map(|((_, component), state)| (device::component_key(component), *state))
                 .collect())
         }
 
