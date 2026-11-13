@@ -90,6 +90,33 @@ struct Btf<'a> {
     types: Vec<(u32, usize)>,
 }
 
+fn scan_types(
+    data: &[u8],
+    types_base: usize,
+    types_end: usize,
+) -> anyhow::Result<Vec<(u32, usize)>> {
+    let mut types = Vec::new();
+    let mut off = types_base;
+    while off < types_end {
+        let info = le_u32(data, off + 4)?;
+        let kind = (info >> 24) & 0x1f;
+        let vlen = (info & 0xffff) as usize;
+        let record = 12
+            + payload_size(kind, vlen)
+                .with_context(|| format!("bad BTF kind {kind} at offset {off}"))?;
+        let next = off
+            .checked_add(record)
+            .context("type record offset overflow")?;
+        ensure!(
+            next <= types_end,
+            "type record extends past the type section"
+        );
+        types.push((info, off));
+        off = next;
+    }
+    Ok(types)
+}
+
 impl<'a> Btf<'a> {
     fn parse(data: &'a [u8]) -> anyhow::Result<Self> {
         ensure!(data.len() >= 24, "vmlinux BTF too small for header");
@@ -130,25 +157,7 @@ impl<'a> Btf<'a> {
             "vmlinux BTF header extends past end of data"
         );
 
-        let mut types = Vec::new();
-        let mut off = types_base;
-        while off < types_end {
-            let info = le_u32(data, off + 4)?;
-            let kind = (info >> 24) & 0x1f;
-            let vlen = (info & 0xffff) as usize;
-            let record = 12
-                + payload_size(kind, vlen)
-                    .with_context(|| format!("bad BTF kind {kind} at offset {off}"))?;
-            let next = off
-                .checked_add(record)
-                .context("type record offset overflow")?;
-            ensure!(
-                next <= types_end,
-                "type record extends past the type section"
-            );
-            types.push((info, off));
-            off = next;
-        }
+        let types = scan_types(data, types_base, types_end)?;
 
         Ok(Self {
             data,
