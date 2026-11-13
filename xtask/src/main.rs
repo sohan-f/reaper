@@ -126,9 +126,7 @@ fn find_ndk() -> anyhow::Result<PathBuf> {
 }
 
 fn dirs_home() -> PathBuf {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+    env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
 }
 
 fn newest_child(dir: &Path) -> Option<PathBuf> {

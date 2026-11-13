@@ -132,8 +132,7 @@ impl RespawnGuard {
             .backoff
             .get(&uid)
             .filter(|backoff| now_ns < backoff.until_ns)
-            .map(|backoff| backoff.level)
-            .unwrap_or(0);
+            .map_or(0, |backoff| backoff.level);
         grace_ms.saturating_mul(1u64 << level).min(MAX_GRACE_MS)
     }
 }

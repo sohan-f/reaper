@@ -893,7 +893,7 @@ mod tests {
     fn policy(deny: &[&str], layer1: Option<Layer1Policy>, never_kill: &[&str]) -> Policy {
         let mut policy = Policy {
             layer1,
-            never_kill: never_kill.iter().map(|p| p.to_string()).collect(),
+            never_kill: never_kill.iter().map(ToString::to_string).collect(),
             ..Policy::default()
         };
         policy.deny = deny

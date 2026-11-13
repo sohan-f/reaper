@@ -42,7 +42,7 @@ pub fn pids_of_uid(uid: u32) -> Vec<u32> {
     let dir = format!("/sys/fs/cgroup/apps/uid_{uid}");
     match fs::read_dir(&dir) {
         Ok(entries) => entries
-            .filter_map(|entry| entry.ok())
+            .flatten()
             .filter_map(|entry| {
                 let name = entry.file_name().into_string().ok()?;
                 name.strip_prefix("pid_")?.parse::<u32>().ok()
@@ -51,7 +51,7 @@ pub fn pids_of_uid(uid: u32) -> Vec<u32> {
         Err(_) => {
             let mut pids = Vec::new();
             if let Ok(entries) = fs::read_dir("/proc") {
-                for entry in entries.filter_map(|entry| entry.ok()) {
+                for entry in entries.flatten() {
                     let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
                         continue;
                     };

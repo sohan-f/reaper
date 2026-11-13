@@ -100,8 +100,7 @@ fn print_usage() {
 fn parse_args() -> anyhow::Result<Config> {
     let mut cfg = Config {
         bpf_object: std::env::var_os("REAPER_BPF_OBJECT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_BPF_OBJECT)),
+            .map_or_else(|| PathBuf::from(DEFAULT_BPF_OBJECT), PathBuf::from),
         btf: PathBuf::from(DEFAULT_BTF),
         policy: PathBuf::from(DEFAULT_POLICY),
         deny_overrides: Vec::new(),
@@ -112,7 +111,7 @@ fn parse_args() -> anyhow::Result<Config> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--bpf-object" => {
-                cfg.bpf_object = PathBuf::from(args.next().context("--bpf-object needs a path")?)
+                cfg.bpf_object = PathBuf::from(args.next().context("--bpf-object needs a path")?);
             }
             "--btf" => cfg.btf = PathBuf::from(args.next().context("--btf needs a path")?),
             "--policy" => cfg.policy = PathBuf::from(args.next().context("--policy needs a path")?),
@@ -227,7 +226,7 @@ fn boottime_ns() -> u64 {
         tv_nsec: 0,
     };
     // SAFETY: ts is a writable timespec and CLOCK_BOOTTIME is always supported.
-    unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
+    unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &raw mut ts) };
     (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
 }
 
@@ -251,7 +250,7 @@ fn rearm_timer(fd: RawFd, deadline_ns: Option<u64>) -> anyhow::Result<()> {
         }
     }
     // SAFETY: fd is a valid timerfd created by this process; its is a valid itimerspec.
-    let rc = unsafe { libc::timerfd_settime(fd, 0, &its, std::ptr::null_mut()) };
+    let rc = unsafe { libc::timerfd_settime(fd, 0, &raw const its, std::ptr::null_mut()) };
     ensure!(
         rc == 0,
         "timerfd_settime failed: {}",
@@ -562,7 +561,7 @@ fn sweep(daemon: &mut Daemon) {
         return;
     };
     let uid_dirs: Vec<u32> = uid_dirs
-        .filter_map(|entry| entry.ok())
+        .flatten()
         .filter_map(|entry| {
             entry
                 .file_name()
@@ -813,16 +812,16 @@ fn run() -> anyhow::Result<()> {
     // SAFETY: sigset_t is zero-initializable POD.
     let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
     // SAFETY: sigset points to a valid sigset_t.
-    unsafe { libc::sigemptyset(&mut sigset) };
+    unsafe { libc::sigemptyset(&raw mut sigset) };
     for sig in [libc::SIGHUP, libc::SIGTERM, libc::SIGUSR1, libc::SIGUSR2] {
         // SAFETY: sigset is valid and sig is a valid signal number.
-        unsafe { libc::sigaddset(&mut sigset, sig) };
+        unsafe { libc::sigaddset(&raw mut sigset, sig) };
     }
     // SAFETY: sigset is a valid sigset_t.
-    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut()) };
+    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const sigset, std::ptr::null_mut()) };
     let signal_fd = unsafe {
         // SAFETY: signal_fd outlives the loop; flags are valid.
-        libc::signalfd(-1, &sigset, libc::SFD_CLOEXEC)
+        libc::signalfd(-1, &raw const sigset, libc::SFD_CLOEXEC)
     };
     ensure!(signal_fd >= 0, "signalfd failed");
 
@@ -842,7 +841,7 @@ fn run() -> anyhow::Result<()> {
             u64: tag,
         };
         // SAFETY: epfd and fd are valid open fds; event outlives the call.
-        let rc = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut event) };
+        let rc = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &raw mut event) };
         ensure!(
             rc == 0,
             "epoll_ctl(ADD, fd={fd}) failed: {}",
@@ -915,11 +914,7 @@ fn run() -> anyhow::Result<()> {
                     let mut expirations: u64 = 0;
                     // SAFETY: expirations is a writable u64; timer_fd is valid.
                     let rc = unsafe {
-                        libc::read(
-                            timer_fd,
-                            &mut expirations as *mut u64 as *mut libc::c_void,
-                            8,
-                        )
+                        libc::read(timer_fd, (&raw mut expirations).cast::<libc::c_void>(), 8)
                     };
                     if rc != 8 {
                         warn!("timerfd read returned {rc}");
@@ -935,7 +930,11 @@ fn run() -> anyhow::Result<()> {
                     let mut buf = [0u8; 4096];
                     // SAFETY: buf is writable; inotify_fd is a valid nonblocking fd.
                     let rc = unsafe {
-                        libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                        libc::read(
+                            inotify_fd,
+                            buf.as_mut_ptr().cast::<libc::c_void>(),
+                            buf.len(),
+                        )
                     };
                     if rc > 0 {
                         let read = &buf[..rc as usize];
@@ -1000,7 +999,7 @@ fn run() -> anyhow::Result<()> {
                     let rc = unsafe {
                         libc::read(
                             signal_fd,
-                            &mut siginfo as *mut _ as *mut libc::c_void,
+                            (&raw mut siginfo).cast::<libc::c_void>(),
                             std::mem::size_of::<libc::signalfd_siginfo>(),
                         )
                     };

@@ -20,7 +20,7 @@ pub const PACKAGES: &[&str] = &[
 
 /// Returns the built-in never-kill set, including role holders for `users`.
 pub fn resolve(users: &[u32]) -> Vec<String> {
-    let mut packages: Vec<String> = PACKAGES.iter().map(|package| package.to_string()).collect();
+    let mut packages: Vec<String> = PACKAGES.iter().map(ToString::to_string).collect();
     for &user in users {
         for (role, package) in [
             ("launcher", resolve_launcher(user)),
