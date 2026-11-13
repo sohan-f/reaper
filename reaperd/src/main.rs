@@ -5,6 +5,8 @@
 //! epoll loop. A backgrounded denied app is force-stopped in enforce mode and
 //! logged in observe mode.
 
+#![deny(unsafe_code)]
+
 mod btf;
 mod command;
 mod decide;
@@ -13,6 +15,7 @@ mod layer1;
 mod never_kill;
 mod pending;
 mod policy;
+mod sys;
 mod uidmap;
 
 use std::{
@@ -21,9 +24,10 @@ use std::{
     os::unix::io::RawFd,
     path::{Path, PathBuf},
     process,
+    time::Duration,
 };
 
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, bail};
 use aya::{
     EbpfLoader, Endianness,
     maps::{HashMap as BpfHashMap, RingBuf},
@@ -220,42 +224,9 @@ fn inotify_header(bytes: &[u8], offset: usize) -> Option<(i32, u32, usize)> {
     Some((wd, mask, len))
 }
 
-fn boottime_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: ts is a writable timespec and CLOCK_BOOTTIME is always supported.
-    unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &raw mut ts) };
-    (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
-}
-
 fn rearm_timer(fd: RawFd, deadline_ns: Option<u64>) -> anyhow::Result<()> {
-    let rel = deadline_ns.map(|d| d.saturating_sub(boottime_ns()));
-    let mut its = libc::itimerspec {
-        it_interval: libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        },
-        it_value: libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        },
-    };
-    if let Some(rel) = rel {
-        its.it_value.tv_sec = (rel / 1_000_000_000) as libc::time_t;
-        its.it_value.tv_nsec = (rel % 1_000_000_000) as libc::c_long;
-        if its.it_value.tv_sec == 0 && its.it_value.tv_nsec == 0 {
-            its.it_value.tv_nsec = 1_000_000;
-        }
-    }
-    // SAFETY: fd is a valid timerfd created by this process; its is a valid itimerspec.
-    let rc = unsafe { libc::timerfd_settime(fd, 0, &raw const its, std::ptr::null_mut()) };
-    ensure!(
-        rc == 0,
-        "timerfd_settime failed: {}",
-        std::io::Error::last_os_error()
-    );
+    let rel = deadline_ns.map(|d| Duration::from_nanos(d.saturating_sub(sys::boottime_ns())));
+    sys::timer_arm(fd, rel).context("timerfd_settime failed")?;
     Ok(())
 }
 
@@ -462,7 +433,7 @@ fn decide_and_log(daemon: &mut Daemon, user: u32, appid: u32) {
             info!("uid {owner_uid}: keep (foreground/visible, min adj {min_adj})");
         }
         Decision::Background { min_adj } => {
-            let now = boottime_ns();
+            let now = sys::boottime_ns();
             if layer1_apply_allowed(daemon) {
                 let mut ops = layer1::AndroidOps;
                 for package in daemon.uid_map.packages_of(appid) {
@@ -579,7 +550,7 @@ fn sweep(daemon: &mut Daemon) {
             let user = uid / 100_000;
             let adj_values = decide::adj_values_of_uid(uid);
             if let Decision::Background { min_adj } = decide::decide(&adj_values, entry.keep_adj) {
-                let now = boottime_ns();
+                let now = sys::boottime_ns();
                 let grace_ms = daemon.respawn.effective_grace(uid, entry.grace_ms, now);
                 let deadline = now.saturating_add(grace_ms.saturating_mul(1_000_000));
                 if daemon.pending.insert(user, entry.appid, deadline) {
@@ -785,68 +756,32 @@ fn run() -> anyhow::Result<()> {
         reconcile_layer1(&daemon);
     }
 
-    // SAFETY: no preconditions; failure reported as -1 and checked.
-    let inotify_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
-    ensure!(inotify_fd >= 0, "inotify_init1 failed");
-    let reaper_wd = unsafe {
-        // SAFETY: inotify_fd is valid; the path is a valid C string.
-        libc::inotify_add_watch(
-            inotify_fd,
-            c"/data/adb/reaper".as_ptr(),
-            libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_DELETE | libc::IN_CREATE,
-        )
-    };
-    ensure!(reaper_wd >= 0, "inotify_add_watch on {REAPER_DIR} failed");
-    let system_wd = unsafe {
-        // SAFETY: inotify_fd is valid; the path is a valid C string.
-        libc::inotify_add_watch(
-            inotify_fd,
-            c"/data/system".as_ptr(),
-            libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO,
-        )
-    };
-    if system_wd < 0 {
+    let inotify_fd = sys::inotify_create().context("inotify_init1 failed")?;
+    let reaper_wd = sys::inotify_add(
+        inotify_fd,
+        c"/data/adb/reaper",
+        libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_DELETE | libc::IN_CREATE,
+    )
+    .with_context(|| format!("inotify_add_watch on {REAPER_DIR} failed"))?;
+    let system_wd = sys::inotify_add(
+        inotify_fd,
+        c"/data/system",
+        libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO,
+    )
+    .ok();
+    if system_wd.is_none() {
         warn!("cannot watch /data/system for packages.list; package changes need SIGHUP to reload");
     }
 
-    // SAFETY: sigset_t is zero-initializable POD.
-    let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
-    // SAFETY: sigset points to a valid sigset_t.
-    unsafe { libc::sigemptyset(&raw mut sigset) };
-    for sig in [libc::SIGHUP, libc::SIGTERM, libc::SIGUSR1, libc::SIGUSR2] {
-        // SAFETY: sigset is valid and sig is a valid signal number.
-        unsafe { libc::sigaddset(&raw mut sigset, sig) };
-    }
-    // SAFETY: sigset is a valid sigset_t.
-    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const sigset, std::ptr::null_mut()) };
-    let signal_fd = unsafe {
-        // SAFETY: signal_fd outlives the loop; flags are valid.
-        libc::signalfd(-1, &raw const sigset, libc::SFD_CLOEXEC)
-    };
-    ensure!(signal_fd >= 0, "signalfd failed");
+    let signal_fd = sys::signal_fd(&[libc::SIGHUP, libc::SIGTERM, libc::SIGUSR1, libc::SIGUSR2])
+        .context("signalfd failed")?;
 
-    let timer_fd = unsafe {
-        // SAFETY: CLOCK_BOOTTIME is supported on this kernel.
-        libc::timerfd_create(libc::CLOCK_BOOTTIME, libc::TFD_CLOEXEC)
-    };
-    ensure!(timer_fd >= 0, "timerfd_create failed");
+    let timer_fd = sys::timer_create().context("timerfd_create failed")?;
 
-    // SAFETY: no preconditions; failure reported as -1 and checked.
-    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-    ensure!(epfd >= 0, "epoll_create1 failed");
+    let epfd = sys::epoll_create().context("epoll_create1 failed")?;
 
     let watch = |fd: RawFd, tag: u64| -> anyhow::Result<()> {
-        let mut event = libc::epoll_event {
-            events: libc::EPOLLIN as u32,
-            u64: tag,
-        };
-        // SAFETY: epfd and fd are valid open fds; event outlives the call.
-        let rc = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &raw mut event) };
-        ensure!(
-            rc == 0,
-            "epoll_ctl(ADD, fd={fd}) failed: {}",
-            std::io::Error::last_os_error()
-        );
+        sys::epoll_add(epfd, fd, tag).with_context(|| format!("epoll_ctl(ADD, fd={fd}) failed"))?;
         Ok(())
     };
     watch(ring.as_raw_fd(), 1)?;
@@ -866,20 +801,18 @@ fn run() -> anyhow::Result<()> {
         daemon.armed
     );
 
-    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 16];
+    let mut tags = [0u64; 16];
     loop {
-        // SAFETY: events is a writable buffer of the reported size.
-        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), events.len() as i32, -1) };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
+        let n = match sys::epoll_wait(epfd, &mut tags) {
+            Ok(n) => n,
+            Err(err) if err.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(err) => {
+                error!("epoll_wait failed: {err}");
+                bail!("epoll_wait: {err}");
             }
-            error!("epoll_wait failed: {err}");
-            bail!("epoll_wait: {err}");
-        }
-        for event in events.iter().take(n as usize) {
-            match event.u64 {
+        };
+        for tag in tags.iter().take(n) {
+            match tag {
                 1 => {
                     while let Some(item) = ring.next() {
                         match parse_event(&item) {
@@ -887,7 +820,7 @@ fn run() -> anyhow::Result<()> {
                                 daemon.nominations += 1;
                                 let user = ev.uid / 100_000;
                                 let appid = ev.uid % 100_000;
-                                let now = boottime_ns();
+                                let now = sys::boottime_ns();
                                 let Some((grace_ms, _)) = deny_params(&daemon, appid) else {
                                     info!(
                                         "dropping nomination for user {user} appid {appid}: no longer denied"
@@ -911,15 +844,10 @@ fn run() -> anyhow::Result<()> {
                     }
                 }
                 2 => {
-                    let mut expirations: u64 = 0;
-                    // SAFETY: expirations is a writable u64; timer_fd is valid.
-                    let rc = unsafe {
-                        libc::read(timer_fd, (&raw mut expirations).cast::<libc::c_void>(), 8)
-                    };
-                    if rc != 8 {
-                        warn!("timerfd read returned {rc}");
+                    if let Err(err) = sys::read_u64(timer_fd) {
+                        warn!("timerfd read failed: {err}");
                     }
-                    let now = boottime_ns();
+                    let now = sys::boottime_ns();
                     let due = daemon.pending.pop_due(now);
                     for (user, appid) in due {
                         decide_and_log(&mut daemon, user, appid);
@@ -928,115 +856,101 @@ fn run() -> anyhow::Result<()> {
                 }
                 3 => {
                     let mut buf = [0u8; 4096];
-                    // SAFETY: buf is writable; inotify_fd is a valid nonblocking fd.
-                    let rc = unsafe {
-                        libc::read(
-                            inotify_fd,
-                            buf.as_mut_ptr().cast::<libc::c_void>(),
-                            buf.len(),
-                        )
-                    };
-                    if rc > 0 {
-                        let read = &buf[..rc as usize];
-                        let mut offset = 0usize;
-                        while offset + 16 <= read.len() {
-                            let Some((wd, mask, len)) = inotify_header(read, offset) else {
-                                break;
-                            };
-                            let name_start = offset + 16;
-                            let name_end = (name_start + len).min(read.len());
-                            let name = String::from_utf8_lossy(&read[name_start..name_end]);
-                            let name = name.trim_end_matches('\0').to_string();
-                            if wd == reaper_wd {
-                                if name == "armed" {
-                                    let armed = Path::new(ARMED_FILE).exists();
-                                    if armed && !daemon.armed {
-                                        daemon.armed = true;
-                                        info!("armed; enforcing");
-                                        sweep(&mut daemon);
-                                        rearm_timer(timer_fd, daemon.pending.earliest())?;
-                                        reconcile_layer1(&daemon);
-                                    } else if !armed && daemon.armed {
-                                        daemon.armed = false;
-                                        info!("disarmed");
+                    match sys::read_bytes(inotify_fd, &mut buf) {
+                        Ok(0) => {}
+                        Err(err) => warn!("inotify read failed: {err}"),
+                        Ok(read_len) => {
+                            let read = &buf[..read_len];
+                            let mut offset = 0usize;
+                            while offset + 16 <= read.len() {
+                                let Some((wd, mask, len)) = inotify_header(read, offset) else {
+                                    break;
+                                };
+                                let name_start = offset + 16;
+                                let name_end = (name_start + len).min(read.len());
+                                let name = String::from_utf8_lossy(&read[name_start..name_end]);
+                                let name = name.trim_end_matches('\0').to_string();
+                                if wd == reaper_wd {
+                                    if name == "armed" {
+                                        let armed = Path::new(ARMED_FILE).exists();
+                                        if armed && !daemon.armed {
+                                            daemon.armed = true;
+                                            info!("armed; enforcing");
+                                            sweep(&mut daemon);
+                                            rearm_timer(timer_fd, daemon.pending.earliest())?;
+                                            reconcile_layer1(&daemon);
+                                        } else if !armed && daemon.armed {
+                                            daemon.armed = false;
+                                            info!("disarmed");
+                                        }
+                                    } else if name == "disable" {
+                                        info!("kill-switch marker changed");
+                                    } else if name == "panic" {
+                                        info!("panic marker changed");
+                                    } else if name == "policy.toml"
+                                        && mask & (libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO) != 0
+                                        && let Err(err) = reload_policy(&mut daemon, &mut deny_map)
+                                    {
+                                        error!("policy reload failed: {err:#}");
                                     }
-                                } else if name == "disable" {
-                                    info!("kill-switch marker changed");
-                                } else if name == "panic" {
-                                    info!("panic marker changed");
-                                } else if name == "policy.toml"
+                                } else if Some(wd) == system_wd
+                                    && name == "packages.list"
                                     && mask & (libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO) != 0
-                                    && let Err(err) = reload_policy(&mut daemon, &mut deny_map)
                                 {
-                                    error!("policy reload failed: {err:#}");
-                                }
-                            } else if wd == system_wd
-                                && name == "packages.list"
-                                && mask & (libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO) != 0
-                            {
-                                match UidMap::load(Path::new(PACKAGES_LIST)) {
-                                    Ok(map) => {
-                                        info!("uid map rebuilt: {} packages", map.package_count());
-                                        daemon.uid_map = map;
-                                        daemon.uid_map_ready = true;
-                                        rebuild_deny(&mut daemon, &mut deny_map);
-                                        reconcile_layer1(&daemon);
-                                    }
-                                    Err(err) => {
-                                        error!("failed to rebuild uid map: {err:#}");
-                                        daemon.uid_map_ready = false;
+                                    match UidMap::load(Path::new(PACKAGES_LIST)) {
+                                        Ok(map) => {
+                                            info!(
+                                                "uid map rebuilt: {} packages",
+                                                map.package_count()
+                                            );
+                                            daemon.uid_map = map;
+                                            daemon.uid_map_ready = true;
+                                            rebuild_deny(&mut daemon, &mut deny_map);
+                                            reconcile_layer1(&daemon);
+                                        }
+                                        Err(err) => {
+                                            error!("failed to rebuild uid map: {err:#}");
+                                            daemon.uid_map_ready = false;
+                                        }
                                     }
                                 }
+                                offset = name_start + len;
                             }
-                            offset = name_start + len;
                         }
                     }
                 }
-                4 => {
-                    // SAFETY: signalfd_siginfo is zero-initializable POD.
-                    let mut siginfo: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
-                    // SAFETY: siginfo is a valid signalfd_siginfo; signal_fd is valid.
-                    let rc = unsafe {
-                        libc::read(
-                            signal_fd,
-                            (&raw mut siginfo).cast::<libc::c_void>(),
-                            std::mem::size_of::<libc::signalfd_siginfo>(),
-                        )
-                    };
-                    if rc == std::mem::size_of::<libc::signalfd_siginfo>() as isize {
-                        match siginfo.ssi_signo as i32 {
-                            libc::SIGHUP => {
-                                if let Err(err) = reload_policy(&mut daemon, &mut deny_map) {
-                                    error!("policy reload failed: {err:#}");
-                                }
-                            }
-                            libc::SIGTERM => {
-                                info!("SIGTERM received; exiting");
-                                return Ok(());
-                            }
-                            libc::SIGUSR1 => {
-                                daemon.armed = true;
-                                info!("SIGUSR1: armed; enforcing");
-                                sweep(&mut daemon);
-                                rearm_timer(timer_fd, daemon.pending.earliest())?;
-                                reconcile_layer1(&daemon);
-                            }
-                            libc::SIGUSR2 => {
-                                info!(
-                                    "stats: nominations={} would_stop={} stops={} pending={} armed={} deny_entries={} budget_tripped={}",
-                                    daemon.nominations,
-                                    daemon.would_stop,
-                                    daemon.stops,
-                                    daemon.pending.len(),
-                                    daemon.armed,
-                                    daemon.deny.len(),
-                                    daemon.budget.tripped(),
-                                );
-                            }
-                            _ => {}
+                4 => match sys::read_signal(signal_fd) {
+                    Ok(Some(libc::SIGHUP)) => {
+                        if let Err(err) = reload_policy(&mut daemon, &mut deny_map) {
+                            error!("policy reload failed: {err:#}");
                         }
                     }
-                }
+                    Ok(Some(libc::SIGTERM)) => {
+                        info!("SIGTERM received; exiting");
+                        return Ok(());
+                    }
+                    Ok(Some(libc::SIGUSR1)) => {
+                        daemon.armed = true;
+                        info!("SIGUSR1: armed; enforcing");
+                        sweep(&mut daemon);
+                        rearm_timer(timer_fd, daemon.pending.earliest())?;
+                        reconcile_layer1(&daemon);
+                    }
+                    Ok(Some(libc::SIGUSR2)) => {
+                        info!(
+                            "stats: nominations={} would_stop={} stops={} pending={} armed={} deny_entries={} budget_tripped={}",
+                            daemon.nominations,
+                            daemon.would_stop,
+                            daemon.stops,
+                            daemon.pending.len(),
+                            daemon.armed,
+                            daemon.deny.len(),
+                            daemon.budget.tripped(),
+                        );
+                    }
+                    Ok(Some(_) | None) => {}
+                    Err(err) => warn!("signalfd read failed: {err}"),
+                },
                 other => warn!("unknown epoll tag {other}"),
             }
         }
