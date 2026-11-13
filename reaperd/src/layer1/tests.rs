@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use super::*;
-use crate::policy::{AppOpSetting, DenyRule};
+use crate::layer1::device::{ComponentState, RestoreOutcome};
+use crate::layer1::journal::Kind;
+use crate::policy::{AppOpSetting, DenyRule, Layer1Policy};
 
 #[derive(Default)]
 struct FakeOps {
