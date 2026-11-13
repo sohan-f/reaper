@@ -29,16 +29,23 @@ pub enum ReceiverFilter {
     IncludingDisabled,
 }
 
+/// The enabled setting `dumpsys package` reports for one component.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentState {
+    /// No explicit setting; the manifest decides.
     Default,
+    /// Explicitly enabled.
     Enabled,
+    /// Disabled by the system or by reaperd.
     Disabled,
+    /// Disabled by the user.
     DisabledUser,
+    /// Disabled until the user launches it.
     DisabledUntilUsed,
 }
 
 impl ComponentState {
+    /// Returns the spelling `pm` and `dumpsys` use for this state.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
@@ -49,6 +56,7 @@ impl ComponentState {
         }
     }
 
+    /// Parses the spelling `dumpsys package` printed.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "default" => Some(Self::Default),
@@ -60,42 +68,56 @@ impl ComponentState {
         }
     }
 
+    /// Returns whether the setting keeps the component from starting.
     pub fn is_disabled(self) -> bool {
         !matches!(self, Self::Default | Self::Enabled)
     }
 }
 
+/// The device commands Layer 1 needs, behind a trait so tests can fake them.
 pub trait Ops {
+    /// Lists the receivers registered for `action` in `user`.
     fn receivers(
         &mut self,
         user: u32,
         action: &str,
         filter: ReceiverFilter,
     ) -> anyhow::Result<Vec<String>>;
+    /// Reads the enabled setting of every component of `package`.
     fn component_states(
         &mut self,
         user: u32,
         package: &str,
     ) -> anyhow::Result<HashMap<String, ComponentState>>;
+    /// Reads the current mode of one app op.
     fn appop(&mut self, user: u32, package: &str, op: &str) -> anyhow::Result<String>;
+    /// Reads the current standby bucket as the integer `am` prints.
     fn standby_bucket(&mut self, user: u32, package: &str) -> anyhow::Result<String>;
+    /// Disables one component of `package`.
     fn disable_component(&mut self, user: u32, component: &str) -> anyhow::Result<()>;
+    /// Restores the recorded enabled setting of one component.
     fn restore_component(
         &mut self,
         user: u32,
         component: &str,
         state: ComponentState,
     ) -> anyhow::Result<RestoreOutcome>;
+    /// Sets one app op of `package`.
     fn set_appop(&mut self, user: u32, package: &str, op: &str, mode: &str) -> anyhow::Result<()>;
+    /// Sets the standby bucket of `package`.
     fn set_standby_bucket(&mut self, user: u32, package: &str, bucket: &str) -> anyhow::Result<()>;
 }
 
+/// What a restore command reported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestoreOutcome {
+    /// The previous setting is back.
     Restored,
+    /// The component no longer exists in the package manifest.
     UnknownComponent,
 }
 
+/// [`Ops`] backed by the device's `cmd`, `pm`, `am`, and `dumpsys` binaries.
 pub struct AndroidOps;
 
 impl Ops for AndroidOps {
@@ -226,6 +248,7 @@ fn run_output(program: &str, args: &[&str]) -> anyhow::Result<std::process::Outp
         .with_context(|| format!("failed to run {program} {}", args.join(" ")))
 }
 
+/// Maps a configured standby bucket name to the integer `am` uses.
 pub fn standby_bucket_id(name: &str) -> Option<u32> {
     match name {
         "active" => Some(10),
