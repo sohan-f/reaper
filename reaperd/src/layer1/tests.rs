@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use super::*;
 use crate::layer1::device::{ComponentState, RestoreOutcome};
 use crate::layer1::journal::Kind;
+use crate::layer1::parse::component_key;
 use crate::policy::{AppOpSetting, DenyRule, Layer1Policy};
 
 #[derive(Default)]
@@ -91,7 +92,7 @@ impl Ops for FakeOps {
             .states
             .iter()
             .filter(|((u, component), _)| *u == user && component.starts_with(&prefix))
-            .map(|((_, component), state)| (device::component_key(component), *state))
+            .map(|((_, component), state)| (component_key(component), *state))
             .collect())
     }
 

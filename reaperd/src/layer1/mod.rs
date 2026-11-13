@@ -7,6 +7,7 @@
 mod apply;
 mod device;
 mod journal;
+mod parse;
 mod restore;
 
 use std::{

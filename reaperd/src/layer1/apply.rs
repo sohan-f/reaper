@@ -4,8 +4,9 @@ use std::collections::{HashMap, HashSet};
 
 use log::{error, info, warn};
 
-use super::device::{self, ComponentState};
+use super::device::ComponentState;
 use super::journal::{Item, Journal, Kind};
+use super::parse::component_key;
 use super::{ACTIONS, Deadline, Ops, ReceiverFilter, save_or_log, standby_bucket_id};
 use crate::policy::{AppOpSetting, Layer1Policy};
 
@@ -158,7 +159,7 @@ fn disable_component(
 ) {
     let previous = match states {
         Some(states) => states
-            .get(&device::component_key(&component))
+            .get(&component_key(&component))
             .copied()
             .unwrap_or(ComponentState::Default),
         // The query returns enabled components only, so `enabled` restores
