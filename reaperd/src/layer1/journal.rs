@@ -14,26 +14,36 @@ use std::{
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 
+/// On-disk format version; a mismatch refuses to load.
 pub const VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
+    /// A boot receiver component that was disabled.
     Receiver,
+    /// An app op that was set.
     Appop,
+    /// A standby bucket that was set.
     Standby,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
+    /// Android user the mutation applied to.
     pub user: u32,
+    /// Package the mutation applied to.
     pub package: String,
+    /// Category of the mutation.
     pub kind: Kind,
+    /// Component, app-op name, or `"bucket"`.
     pub key: String,
+    /// Value the mutation replaced, in the format the restore command takes.
     pub previous: String,
 }
 
 impl Item {
+    /// Builds one journal entry.
     pub fn new(
         user: u32,
         package: impl Into<String>,
@@ -50,6 +60,7 @@ impl Item {
         }
     }
 
+    /// Returns whether this item addresses the same device setting.
     pub fn same_key(&self, user: u32, package: &str, kind: Kind, key: &str) -> bool {
         self.user == user && self.package == package && self.kind == kind && self.key == key
     }
@@ -68,12 +79,19 @@ struct DocumentRef<'a> {
     item: &'a [Item],
 }
 
+/// The journal file and its items, kept in memory while a pass runs.
 pub struct Journal {
     path: PathBuf,
     items: Vec<Item>,
 }
 
 impl Journal {
+    /// Loads the journal, treating a missing file as empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or parsed, or carries an
+    /// unsupported version.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
@@ -101,16 +119,19 @@ impl Journal {
         })
     }
 
+    /// Returns every journaled item.
     pub fn items(&self) -> &[Item] {
         &self.items
     }
 
+    /// Finds the item that already covers one device setting.
     pub fn find(&self, user: u32, package: &str, kind: Kind, key: &str) -> Option<&Item> {
         self.items
             .iter()
             .find(|item| item.same_key(user, package, kind, key))
     }
 
+    /// Appends `item` unless an item for the same setting exists.
     pub fn append(&mut self, item: Item) -> bool {
         if self
             .find(item.user, &item.package, item.kind, &item.key)
@@ -122,6 +143,7 @@ impl Journal {
         true
     }
 
+    /// Drops the item for one device setting and reports whether it existed.
     pub fn remove(&mut self, user: u32, package: &str, kind: Kind, key: &str) -> bool {
         let before = self.items.len();
         self.items
@@ -129,12 +151,19 @@ impl Journal {
         self.items.len() != before
     }
 
+    /// Drops every item belonging to `package` and returns how many were removed.
     pub fn remove_package(&mut self, package: &str) -> usize {
         let before = self.items.len();
         self.items.retain(|item| item.package != package);
         before - self.items.len()
     }
 
+    /// Writes the journal atomically with mode 0600.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the document cannot be serialized or the file cannot
+    /// be written or renamed into place.
     pub fn save(&self) -> anyhow::Result<()> {
         let document = DocumentRef {
             version: VERSION,
