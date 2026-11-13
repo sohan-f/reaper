@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 /// On-disk format version; a mismatch refuses to load.
 pub const VERSION: u32 = 1;
 
+/// Category of a journaled mutation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -28,6 +29,7 @@ pub enum Kind {
     Standby,
 }
 
+/// One device mutation and the value it replaced.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
     /// Android user the mutation applied to.

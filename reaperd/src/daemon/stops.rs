@@ -252,6 +252,7 @@ impl Daemon {
     }
 }
 
+/// Returns why enforcement is suspended, when a marker says so.
 pub(super) fn stop_reason() -> Option<&'static str> {
     if Path::new(DISABLE_FILE).exists() {
         Some("kill-switch marker present")
