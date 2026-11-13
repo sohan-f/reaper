@@ -167,73 +167,86 @@ impl Policy {
 
         let mut policy = Policy::default();
         if let Some(global) = raw.global {
-            if let Some(mode) = global.mode {
-                policy.mode = match mode.as_str() {
-                    "observe" => Mode::Observe,
-                    "enforce" => Mode::Enforce,
-                    other => bail!("unknown mode {other:?} (expected observe or enforce)"),
-                };
-            }
-            if let Some(v) = global.grace_ms {
-                ensure!(v <= MAX_GRACE_MS, "grace_ms {v} exceeds {MAX_GRACE_MS}");
-                policy.grace_ms = v;
-            }
-            if let Some(v) = global.keep_adj {
-                ensure!((-1000..=1000).contains(&v), "keep_adj {v} out of range");
-                policy.keep_adj = v;
-            }
-            if let Some(v) = global.kill_budget_per_min {
-                policy.kill_budget_per_min = v;
-            }
-            if let Some(v) = global.respawn_window_s {
-                policy.respawn_window_s = v;
-            }
-            if let Some(v) = global.respawn_max {
-                policy.respawn_max = v;
-            }
+            apply_global(&mut policy, global)?;
         }
-
         if let Some(layer1) = raw.layer1 {
             policy.layer1 = Some(parse_layer1(layer1)?);
         }
-
-        for package in raw
-            .never_kill
-            .and_then(|never_kill| never_kill.packages)
-            .unwrap_or_default()
-        {
-            ensure!(
-                !package.is_empty(),
-                "policy contains an empty never_kill package name"
-            );
-            policy.never_kill.push(package);
-        }
-
-        for entry in raw.deny.unwrap_or_default() {
-            ensure!(
-                !entry.package.is_empty(),
-                "policy contains an empty package name"
-            );
-            let keep_adj = entry.keep_adj.unwrap_or(policy.keep_adj);
-            ensure!(
-                (-1000..=1000).contains(&keep_adj),
-                "keep_adj for {} out of range",
-                entry.package
-            );
-            let grace_ms = entry.grace_ms.unwrap_or(policy.grace_ms);
-            ensure!(
-                grace_ms <= MAX_GRACE_MS,
-                "grace_ms for {} exceeds {MAX_GRACE_MS}",
-                entry.package
-            );
-            policy.deny.push(DenyRule {
-                package: entry.package,
-                grace_ms,
-                keep_adj,
-            });
-        }
+        policy.never_kill = parse_never_kill(raw.never_kill)?;
+        policy.deny = parse_deny(raw.deny, &policy)?;
         Ok(policy)
     }
+}
+
+fn apply_global(policy: &mut Policy, global: RawGlobal) -> anyhow::Result<()> {
+    if let Some(mode) = global.mode {
+        policy.mode = match mode.as_str() {
+            "observe" => Mode::Observe,
+            "enforce" => Mode::Enforce,
+            other => bail!("unknown mode {other:?} (expected observe or enforce)"),
+        };
+    }
+    if let Some(v) = global.grace_ms {
+        ensure!(v <= MAX_GRACE_MS, "grace_ms {v} exceeds {MAX_GRACE_MS}");
+        policy.grace_ms = v;
+    }
+    if let Some(v) = global.keep_adj {
+        ensure!((-1000..=1000).contains(&v), "keep_adj {v} out of range");
+        policy.keep_adj = v;
+    }
+    if let Some(v) = global.kill_budget_per_min {
+        policy.kill_budget_per_min = v;
+    }
+    if let Some(v) = global.respawn_window_s {
+        policy.respawn_window_s = v;
+    }
+    if let Some(v) = global.respawn_max {
+        policy.respawn_max = v;
+    }
+    Ok(())
+}
+
+fn parse_never_kill(raw: Option<RawNeverKill>) -> anyhow::Result<Vec<String>> {
+    let mut packages = Vec::new();
+    for package in raw
+        .and_then(|never_kill| never_kill.packages)
+        .unwrap_or_default()
+    {
+        ensure!(
+            !package.is_empty(),
+            "policy contains an empty never_kill package name"
+        );
+        packages.push(package);
+    }
+    Ok(packages)
+}
+
+fn parse_deny(raw: Option<Vec<RawDeny>>, policy: &Policy) -> anyhow::Result<Vec<DenyRule>> {
+    let mut rules = Vec::new();
+    for entry in raw.unwrap_or_default() {
+        ensure!(
+            !entry.package.is_empty(),
+            "policy contains an empty package name"
+        );
+        let keep_adj = entry.keep_adj.unwrap_or(policy.keep_adj);
+        ensure!(
+            (-1000..=1000).contains(&keep_adj),
+            "keep_adj for {} out of range",
+            entry.package
+        );
+        let grace_ms = entry.grace_ms.unwrap_or(policy.grace_ms);
+        ensure!(
+            grace_ms <= MAX_GRACE_MS,
+            "grace_ms for {} exceeds {MAX_GRACE_MS}",
+            entry.package
+        );
+        rules.push(DenyRule {
+            package: entry.package,
+            grace_ms,
+            keep_adj,
+        });
+    }
+    Ok(rules)
 }
 
 /// Returns the appid for a uid, or None if it is not a normal app uid.
@@ -249,9 +262,7 @@ pub fn appid_of(uid: u32) -> Option<u32> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_spec_example() {
-        let text = r#"
+    const SPEC_EXAMPLE: &str = r#"
 [global]
 mode = "observe"
 grace_ms = 2000
@@ -276,16 +287,24 @@ package = "com.instagram.android"
 grace_ms = 30000
 keep_adj = 200
 "#;
-        let policy = Policy::parse(text).expect("spec example must parse");
+
+    #[test]
+    fn parses_spec_global_and_deny() {
+        let policy = Policy::parse(SPEC_EXAMPLE).expect("spec example must parse");
         assert_eq!(policy.mode, Mode::Observe);
         assert_eq!(policy.grace_ms, 2000);
         assert_eq!(policy.keep_adj, 100);
         assert_eq!(policy.deny.len(), 2);
-        assert_eq!(policy.never_kill, ["android", "com.android.systemui"]);
         assert_eq!(policy.deny[1].grace_ms, 30000);
         assert_eq!(policy.deny[1].keep_adj, 200);
         assert_eq!(policy.deny[0].grace_ms, 2000);
         assert_eq!(policy.deny[0].keep_adj, 100);
+    }
+
+    #[test]
+    fn parses_spec_layer1() {
+        let policy = Policy::parse(SPEC_EXAMPLE).expect("spec example must parse");
+        assert_eq!(policy.never_kill, ["android", "com.android.systemui"]);
         let layer1 = policy.layer1.expect("layer1 table must parse");
         assert!(layer1.disable_boot_receivers);
         assert_eq!(
