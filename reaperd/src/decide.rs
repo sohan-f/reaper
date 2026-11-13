@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::Path;
 
+/// What the re-verify step concluded about a nominated uid.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Decision {
     /// No live processes; the app already went away.
@@ -13,6 +14,7 @@ pub enum Decision {
     Background { min_adj: i16 },
 }
 
+/// Classifies a uid by the lowest `oom_score_adj` among its live processes.
 pub fn decide(adj_values: &[i16], keep_adj: i16) -> Decision {
     let Some(min) = adj_values.iter().min().copied() else {
         return Decision::Gone;
@@ -68,6 +70,7 @@ fn metadata_uid(path: &Path) -> Option<u32> {
     fs::metadata(path).ok().map(|m| m.uid())
 }
 
+/// Reads the `oom_score_adj` of every live process owned by `uid`.
 pub fn adj_values_of_uid(uid: u32) -> Vec<i16> {
     pids_of_uid(uid)
         .into_iter()

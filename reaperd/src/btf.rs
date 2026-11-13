@@ -45,6 +45,12 @@ const TYPE_TAG: u32 = 18;
 const ENUM64: u32 = 19;
 const MAX_RESOLVE_DEPTH: usize = 16;
 
+/// Resolves the kernel struct offsets the eBPF program needs from vmlinux BTF.
+///
+/// # Errors
+///
+/// Returns an error if the BTF is malformed, shorter than its declared
+/// sections, or missing one of the expected structs, members, or types.
 pub fn resolve_layout(data: &[u8]) -> anyhow::Result<Layout> {
     let btf = Btf::parse(data)?;
 

@@ -11,13 +11,18 @@ use crate::{command, policy::appid_of};
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// One package as installed for one Android user.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageInstance {
+    /// Android user the package is installed for.
     pub user: u32,
+    /// Full uid (`user * 100_000 + appid`).
     pub uid: u32,
+    /// Appid shared by every user's copy of the package.
     pub appid: u32,
 }
 
+/// Package-to-uid indexes built from `packages.list` or `cmd package list`.
 #[derive(Default)]
 pub struct UidMap {
     packages_by_appid: HashMap<u32, Vec<String>>,
@@ -26,41 +31,49 @@ pub struct UidMap {
 }
 
 impl UidMap {
+    /// Builds an empty map.
     pub fn empty() -> Self {
         Self::default()
     }
 
+    /// Returns the packages that share `appid`.
     pub fn packages_of(&self, appid: u32) -> &[String] {
         self.packages_by_appid
             .get(&appid)
             .map_or(&[], Vec::as_slice)
     }
 
+    /// Returns one instance per user the package is installed for.
     pub fn instances_of(&self, package: &str) -> &[PackageInstance] {
         self.instances_by_package
             .get(package)
             .map_or(&[], Vec::as_slice)
     }
 
+    /// Returns the uid of `package` for user 0.
     pub fn uid_of(&self, package: &str) -> Option<u32> {
         self.instances_of(package)
             .first()
             .map(|instance| instance.uid)
     }
 
+    /// Returns the appid of `package`.
     pub fn appid_of_package(&self, package: &str) -> Option<u32> {
         self.uid_of(package).and_then(appid_of)
     }
 
+    /// Returns how many packages the map knows.
     pub fn package_count(&self) -> usize {
         self.instances_by_package.len()
     }
 
+    /// Returns whether the map knows no packages.
     pub fn is_empty(&self) -> bool {
         self.instances_by_package.is_empty()
     }
 
     /// Returns the user ids present in the map, sorted.
+    /// Returns the Android users any package is installed for.
     pub fn users(&self) -> Vec<u32> {
         let mut users: Vec<u32> = self.user_ids.iter().copied().collect();
         users.sort_unstable();
@@ -83,6 +96,7 @@ impl UidMap {
         }
     }
 
+    /// Parses the root-only `/data/system/packages.list`.
     pub fn parse_packages_list(text: &str) -> Self {
         let mut map = Self::default();
         for line in text.lines() {
@@ -102,6 +116,7 @@ impl UidMap {
         map
     }
 
+    /// Parses `cmd package list packages -U`.
     pub fn parse_cmd_list(text: &str) -> Self {
         let mut map = Self::default();
         for line in text.lines() {
@@ -124,6 +139,12 @@ impl UidMap {
         map
     }
 
+    /// Loads the uid map from `path`, falling back to the shell command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read and the fallback command
+    /// fails or returns no packages.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(text) => Ok(Self::parse_packages_list(&text)),

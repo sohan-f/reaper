@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+/// Nominations waiting for their deadline, coalesced per `(user, appid)`.
 #[derive(Default)]
 pub struct Pending {
     by_deadline: BTreeMap<u64, Vec<(u32, u32)>>,
@@ -22,6 +23,7 @@ impl Pending {
         true
     }
 
+    /// Removes and returns every nomination whose deadline has passed.
     pub fn pop_due(&mut self, now_ns: u64) -> Vec<(u32, u32)> {
         let mut out = Vec::new();
         while let Some((&deadline, _)) = self.by_deadline.iter().next() {
@@ -46,10 +48,12 @@ impl Pending {
         });
     }
 
+    /// Returns the earliest deadline, for arming the timer.
     pub fn earliest(&self) -> Option<u64> {
         self.by_deadline.keys().next().copied()
     }
 
+    /// Returns how many distinct nominations are pending.
     pub fn len(&self) -> usize {
         self.keys.len()
     }
