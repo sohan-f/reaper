@@ -30,9 +30,10 @@ pub struct DenyCfg {
     pub flags: u16,
 }
 
-// SAFETY: both structs are repr(C), every byte is initialized by writers, and
-// any bit pattern is valid, so they may be copied to and from byte slices.
+// SAFETY: repr(C), every byte is initialized by writers, and any bit pattern is
+// valid, so it may be copied to and from byte slices.
 #[cfg(feature = "pod")]
 unsafe impl aya::Pod for Event {}
+// SAFETY: same layout guarantees as `Event`.
 #[cfg(feature = "pod")]
 unsafe impl aya::Pod for DenyCfg {}

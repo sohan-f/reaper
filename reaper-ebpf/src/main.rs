@@ -53,6 +53,7 @@ fn try_run(ctx: &BtfTracePointContext) -> Result<(), i32> {
     let signal: *const u8 = unsafe {
         helpers::bpf_probe_read_kernel(task.add(OFF_SIGNAL.load() as usize).cast::<*const u8>())?
     };
+    // SAFETY: see above.
     let adj: i16 = unsafe {
         helpers::bpf_probe_read_kernel(signal.add(OFF_SIG_OOM_ADJ.load() as usize).cast::<i16>())?
     };
