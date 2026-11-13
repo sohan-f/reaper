@@ -14,6 +14,7 @@ mod decide;
 mod enforce;
 mod layer1;
 mod never_kill;
+mod paths;
 mod pending;
 mod policy;
 mod sys;
@@ -40,17 +41,12 @@ use reaper_common::{DenyCfg, Event};
 use crate::config::Config;
 use crate::decide::Decision;
 use crate::enforce::{KillBudget, RespawnGuard};
+use crate::paths::{
+    ARMED_FILE, BUDGET_FILE, DISABLE_FILE, LAYER1_JOURNAL, PACKAGES_LIST, PANIC_FILE, REAPER_DIR,
+};
 use crate::pending::Pending;
 use crate::policy::{Mode, Policy};
 use crate::uidmap::UidMap;
-
-const PACKAGES_LIST: &str = "/data/system/packages.list";
-const REAPER_DIR: &str = "/data/adb/reaper";
-const ARMED_FILE: &str = "/data/adb/reaper/armed";
-const DISABLE_FILE: &str = "/data/adb/reaper/disable";
-const PANIC_FILE: &str = "/data/adb/reaper/panic";
-const BUDGET_FILE: &str = "/data/adb/reaper/budget-exceeded";
-const LAYER1_JOURNAL: &str = "/data/adb/reaper/layer1-journal.toml";
 
 struct DenyEntry {
     appid: u32,
