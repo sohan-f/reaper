@@ -23,15 +23,26 @@ pub struct Layout {
 }
 
 const BTF_MAGIC: u16 = 0xEB9F;
+const UNKN: u32 = 0;
 const INT: u32 = 1;
 const PTR: u32 = 2;
+const ARRAY: u32 = 3;
 const STRUCT: u32 = 4;
 const UNION: u32 = 5;
+const ENUM: u32 = 6;
+const FWD: u32 = 7;
 const TYPEDEF: u32 = 8;
 const VOLATILE: u32 = 9;
 const CONST: u32 = 10;
 const RESTRICT: u32 = 11;
+const FUNC: u32 = 12;
+const FUNC_PROTO: u32 = 13;
+const VAR: u32 = 14;
+const DATASEC: u32 = 15;
+const FLOAT: u32 = 16;
+const DECL_TAG: u32 = 17;
 const TYPE_TAG: u32 = 18;
+const ENUM64: u32 = 19;
 const MAX_RESOLVE_DEPTH: usize = 16;
 
 pub fn resolve_layout(data: &[u8]) -> anyhow::Result<Layout> {
@@ -271,16 +282,13 @@ impl<'a> Btf<'a> {
 
 fn payload_size(kind: u32, vlen: usize) -> anyhow::Result<usize> {
     Ok(match kind {
-        INT => 4, // encoding word
-        STRUCT | UNION => vlen * 12,
-        3 => 12,         // Array
-        6 => vlen * 8,   // Enum
-        19 => vlen * 12, // Enum64: name_off, val_lo32, val_hi32
-        13 => vlen * 8,  // FuncProto
-        15 => vlen * 12, // DataSec
-        14 => 4,         // Var: linkage
-        17 => 4,         // DeclTag: component index
-        0 | PTR | 7 | TYPEDEF | VOLATILE | CONST | RESTRICT | 12 | 16 | TYPE_TAG => 0,
+        UNKN | PTR | FWD | TYPEDEF | VOLATILE | CONST | RESTRICT | FUNC | FLOAT | TYPE_TAG => 0,
+        // INT carries an encoding word, VAR a linkage, DECL_TAG a component index.
+        INT | VAR | DECL_TAG => 4,
+        ARRAY => 12,
+        // Member, param, data-sec entry, and Enum64 value records are 12 bytes.
+        STRUCT | UNION | DATASEC | ENUM64 => vlen * 12,
+        ENUM | FUNC_PROTO => vlen * 8,
         other => bail!("unsupported BTF kind {other}"),
     })
 }
