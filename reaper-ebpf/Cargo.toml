@@ -7,6 +7,10 @@ license.workspace = true
 authors.workspace = true
 publish = false
 
+# Deliberately does not inherit [workspace.lints]: this crate only builds for
+# bpfel-unknown-none, and the host lints trip a duplicate `panic_impl`.
+[lints]
+
 [dependencies]
 reaper-common.workspace = true
 aya-ebpf.workspace = true
