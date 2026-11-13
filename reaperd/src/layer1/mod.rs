@@ -611,16 +611,16 @@ fn apply_standby(
 
 fn restore_item(journal: &mut Journal, ops: &mut dyn Ops, item: &Item) -> bool {
     let result = match item.kind {
-        Kind::Receiver => match ComponentState::parse(&item.previous) {
-            Some(state) => ops.restore_component(item.user, &item.key, state),
-            None => {
+        Kind::Receiver => {
+            let Some(state) = ComponentState::parse(&item.previous) else {
                 error!(
                     "Layer 1: journal has invalid receiver state {:?} for {}",
                     item.previous, item.key
                 );
                 return false;
-            }
-        },
+            };
+            ops.restore_component(item.user, &item.key, state)
+        }
         Kind::Appop => ops
             .set_appop(item.user, &item.package, &item.key, &item.previous)
             .map(|()| RestoreOutcome::Restored),
