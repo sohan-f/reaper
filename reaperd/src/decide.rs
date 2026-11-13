@@ -7,9 +7,9 @@ use std::path::Path;
 pub enum Decision {
     /// No live processes; the app already went away.
     Gone,
-    /// At least one process is at or below keep_adj; the app is foreground or visible.
+    /// At least one process is at or below `keep_adj`; the app is foreground or visible.
     Keep { min_adj: i16 },
-    /// Every live process is above keep_adj.
+    /// Every live process is above `keep_adj`.
     Background { min_adj: i16 },
 }
 

@@ -3,7 +3,7 @@
 //! `cargo xtask build-ebpf` compiles the eBPF program for bpfel-unknown-none
 //! using the nightly toolchain, `cargo xtask build` additionally compiles
 //! reaperd for aarch64-linux-android against the NDK, and `cargo xtask package`
-//! writes a KernelSU module zip to `dist/`.
+//! writes a `KernelSU` module zip to `dist/`.
 
 use std::{
     env,
