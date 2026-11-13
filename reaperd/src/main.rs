@@ -197,20 +197,28 @@ fn init_logging() {
     }
 }
 
+fn ne_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    bytes
+        .get(offset..offset + 4)
+        .and_then(|b| b.try_into().ok())
+        .map(u32::from_ne_bytes)
+}
+
 fn parse_event(bytes: &[u8]) -> Option<Event> {
-    let word = |i: usize| {
-        bytes
-            .get(i..i + 4)
-            .and_then(|b| b.try_into().ok())
-            .map(u32::from_ne_bytes)
-    };
     Some(Event {
-        uid: word(0)?,
-        tgid: word(4)?,
+        uid: ne_u32(bytes, 0)?,
+        tgid: ne_u32(bytes, 4)?,
         adj: i32::from_ne_bytes(bytes.get(8..12)?.try_into().ok()?),
-        _pad: word(12)?,
+        _pad: ne_u32(bytes, 12)?,
         ts_ns: u64::from_ne_bytes(bytes.get(16..24)?.try_into().ok()?),
     })
+}
+
+fn inotify_header(bytes: &[u8], offset: usize) -> Option<(i32, u32, usize)> {
+    let wd = ne_u32(bytes, offset)? as i32;
+    let mask = ne_u32(bytes, offset + 4)?;
+    let len = ne_u32(bytes, offset + 12)? as usize;
+    Some((wd, mask, len))
 }
 
 fn boottime_ns() -> u64 {
@@ -930,18 +938,15 @@ fn run() -> anyhow::Result<()> {
                         libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
                     };
                     if rc > 0 {
+                        let read = &buf[..rc as usize];
                         let mut offset = 0usize;
-                        while offset + 16 <= rc as usize {
-                            let wd =
-                                i32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap());
-                            let mask =
-                                u32::from_ne_bytes(buf[offset + 4..offset + 8].try_into().unwrap());
-                            let len = u32::from_ne_bytes(
-                                buf[offset + 12..offset + 16].try_into().unwrap(),
-                            ) as usize;
+                        while offset + 16 <= read.len() {
+                            let Some((wd, mask, len)) = inotify_header(read, offset) else {
+                                break;
+                            };
                             let name_start = offset + 16;
-                            let name_end = (name_start + len).min(rc as usize);
-                            let name = String::from_utf8_lossy(&buf[name_start..name_end]);
+                            let name_end = (name_start + len).min(read.len());
+                            let name = String::from_utf8_lossy(&read[name_start..name_end]);
                             let name = name.trim_end_matches('\0').to_string();
                             if wd == reaper_wd {
                                 if name == "armed" {

@@ -285,21 +285,19 @@ fn payload_size(kind: u32, vlen: usize) -> anyhow::Result<usize> {
 }
 
 fn le_u16(data: &[u8], off: usize) -> anyhow::Result<u16> {
-    Ok(u16::from_le_bytes(
-        data.get(off..off + 2)
-            .context("short read in vmlinux BTF")?
-            .try_into()
-            .unwrap(),
-    ))
+    let bytes: [u8; 2] = data
+        .get(off..off + 2)
+        .and_then(|b| b.try_into().ok())
+        .context("short read in vmlinux BTF")?;
+    Ok(u16::from_le_bytes(bytes))
 }
 
 fn le_u32(data: &[u8], off: usize) -> anyhow::Result<u32> {
-    Ok(u32::from_le_bytes(
-        data.get(off..off + 4)
-            .context("short read in vmlinux BTF")?
-            .try_into()
-            .unwrap(),
-    ))
+    let bytes: [u8; 4] = data
+        .get(off..off + 4)
+        .and_then(|b| b.try_into().ok())
+        .context("short read in vmlinux BTF")?;
+    Ok(u32::from_le_bytes(bytes))
 }
 
 #[cfg(test)]
