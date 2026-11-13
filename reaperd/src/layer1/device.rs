@@ -108,26 +108,7 @@ impl Ops for AndroidOps {
         action: &str,
         filter: ReceiverFilter,
     ) -> anyhow::Result<Vec<String>> {
-        let user = user.to_string();
-        let flags = match filter {
-            ReceiverFilter::Enabled => MATCH_DIRECT_BOOT,
-            ReceiverFilter::IncludingDisabled => MATCH_DIRECT_BOOT | MATCH_DISABLED_COMPONENTS,
-        }
-        .to_string();
-        let output = run(
-            CMD,
-            &[
-                "package",
-                "query-receivers",
-                "--brief",
-                "--user",
-                &user,
-                "--query-flags",
-                &flags,
-                "-a",
-                action,
-            ],
-        )?;
+        let output = query_receivers(user, action, filter)?;
         Ok(parse_receivers(&output))
     }
 
@@ -204,6 +185,29 @@ impl Ops for AndroidOps {
         )
         .map(|_| ())
     }
+}
+
+fn query_receivers(user: u32, action: &str, filter: ReceiverFilter) -> anyhow::Result<String> {
+    let user = user.to_string();
+    let flags = match filter {
+        ReceiverFilter::Enabled => MATCH_DIRECT_BOOT,
+        ReceiverFilter::IncludingDisabled => MATCH_DIRECT_BOOT | MATCH_DISABLED_COMPONENTS,
+    }
+    .to_string();
+    run(
+        CMD,
+        &[
+            "package",
+            "query-receivers",
+            "--brief",
+            "--user",
+            &user,
+            "--query-flags",
+            &flags,
+            "-a",
+            action,
+        ],
+    )
 }
 
 fn run(program: &str, args: &[&str]) -> anyhow::Result<String> {
