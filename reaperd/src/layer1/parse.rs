@@ -6,6 +6,7 @@ use anyhow::{Context, ensure};
 
 use super::device::ComponentState;
 
+/// Extracts the component names from `cmd package query-receivers --brief`.
 pub fn parse_receivers(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut components = Vec::new();
@@ -24,6 +25,10 @@ pub fn parse_receivers(text: &str) -> Vec<String> {
     components
 }
 
+/// Extracts one user's component settings from `dumpsys package <pkg>`.
+///
+/// Keys are normalized to `pkg/fully.qualified.Class`, because the dump prints
+/// the stored class name and the receiver query prints the manifest spelling.
 pub fn parse_component_states(
     text: &str,
     user: u32,
@@ -128,6 +133,12 @@ fn insert_inline_components(
     }
 }
 
+/// Reads the mode of one app op from `cmd appops get`.
+///
+/// # Errors
+///
+/// Returns an error when the output has neither an entry for `op` nor a
+/// `No operations.` line, which means the query itself was malformed.
 pub fn parse_appop(text: &str, op: &str) -> anyhow::Result<String> {
     let prefix = format!("{op}:");
     let mut saw_default = false;
@@ -156,6 +167,11 @@ pub fn parse_appop(text: &str, op: &str) -> anyhow::Result<String> {
     Ok("default".to_string())
 }
 
+/// Normalizes `am get-standby-bucket` output to the integer the setter takes.
+///
+/// # Errors
+///
+/// Returns an error if the output is not an integer.
 pub fn parse_standby_bucket(text: &str) -> anyhow::Result<String> {
     let value = text.trim();
     let bucket: u32 = value
