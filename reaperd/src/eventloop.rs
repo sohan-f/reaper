@@ -115,13 +115,13 @@ fn parse_event(bytes: &[u8]) -> Option<Event> {
         uid: ne_u32(bytes, 0)?,
         tgid: ne_u32(bytes, 4)?,
         adj: i32::from_ne_bytes(bytes.get(8..12)?.try_into().ok()?),
-        _pad: ne_u32(bytes, 12)?,
+        pad: ne_u32(bytes, 12)?,
         ts_ns: u64::from_ne_bytes(bytes.get(16..24)?.try_into().ok()?),
     })
 }
 
 fn inotify_header(bytes: &[u8], offset: usize) -> Option<(i32, u32, usize)> {
-    let wd = ne_u32(bytes, offset)? as i32;
+    let wd = ne_u32(bytes, offset)?.cast_signed();
     let mask = ne_u32(bytes, offset + 4)?;
     let len = ne_u32(bytes, offset + 12)? as usize;
     Some((wd, mask, len))
@@ -254,26 +254,35 @@ fn handle_inotify_events(
         let name_start = offset + 16;
         let name_end = (name_start + len).min(read.len());
         let name = String::from_utf8_lossy(&read[name_start..name_end]);
-        let name = name.trim_end_matches('\0').to_string();
-        handle_inotify_name(daemon, deny_map, fds, wd, mask, &name)?;
+        let event = InotifyEvent {
+            wd,
+            mask,
+            name: name.trim_end_matches('\0'),
+        };
+        handle_inotify_name(daemon, deny_map, fds, &event)?;
         offset = name_start + len;
     }
     Ok(())
+}
+
+/// One parsed inotify event, tagged with the watch descriptor that reported it.
+struct InotifyEvent<'a> {
+    wd: i32,
+    mask: u32,
+    name: &'a str,
 }
 
 fn handle_inotify_name(
     daemon: &mut Daemon,
     deny_map: &mut DenyMapMut<'_>,
     fds: &Fds,
-    wd: i32,
-    mask: u32,
-    name: &str,
+    event: &InotifyEvent<'_>,
 ) -> anyhow::Result<()> {
-    if wd == fds.reaper_wd {
-        return handle_reaper_file(daemon, deny_map, fds, mask, name);
+    if event.wd == fds.reaper_wd {
+        return handle_reaper_file(daemon, deny_map, fds, event);
     }
-    if Some(wd) == fds.system_wd {
-        handle_packages_list(daemon, deny_map, mask, name);
+    if Some(event.wd) == fds.system_wd {
+        handle_packages_list(daemon, deny_map, event);
     }
     Ok(())
 }
@@ -282,14 +291,13 @@ fn handle_reaper_file(
     daemon: &mut Daemon,
     deny_map: &mut DenyMapMut<'_>,
     fds: &Fds,
-    mask: u32,
-    name: &str,
+    event: &InotifyEvent<'_>,
 ) -> anyhow::Result<()> {
-    match name {
+    match event.name {
         "armed" => handle_armed(daemon, fds)?,
         "disable" => info!("kill-switch marker changed"),
         "panic" => info!("panic marker changed"),
-        "policy.toml" if mask & (libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO) != 0 => {
+        "policy.toml" if event.mask & (libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO) != 0 => {
             if let Err(err) = daemon.reload_policy(deny_map) {
                 error!("policy reload failed: {err:#}");
             }
@@ -314,8 +322,13 @@ fn handle_armed(daemon: &mut Daemon, fds: &Fds) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle_packages_list(daemon: &mut Daemon, deny_map: &mut DenyMapMut<'_>, mask: u32, name: &str) {
-    if name != "packages.list" || mask & (libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO) == 0 {
+fn handle_packages_list(
+    daemon: &mut Daemon,
+    deny_map: &mut DenyMapMut<'_>,
+    event: &InotifyEvent<'_>,
+) {
+    if event.name != "packages.list" || event.mask & (libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO) == 0
+    {
         return;
     }
     match UidMap::load(Path::new(PACKAGES_LIST)) {

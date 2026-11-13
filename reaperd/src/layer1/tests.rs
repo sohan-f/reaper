@@ -220,7 +220,7 @@ fn reconcile_with(
     path: &Path,
     apply: bool,
 ) {
-    reconcile(policy, &[], map, ops, path, apply);
+    reconcile(&Plan::new(policy, &[], apply), map, ops, path);
 }
 
 fn journal_items(path: &Path) -> Vec<Item> {
@@ -783,7 +783,13 @@ fn reapply_does_not_duplicate_journal_items() {
     assert_eq!(journal_items(&path).len(), 1);
     ops.calls.clear();
 
-    reapply_package(&policy, &[], &map, &mut ops, &path, true, "com.example");
+    reapply_package(
+        &Plan::new(&policy, &[], true),
+        &map,
+        &mut ops,
+        &path,
+        "com.example",
+    );
     assert_eq!(journal_items(&path).len(), 1);
     assert!(!ops.has_call("appop:0:com.example:RUN_IN_BACKGROUND:ignore"));
 }
@@ -806,7 +812,13 @@ fn reapply_repairs_a_stale_setting() {
     );
     ops.calls.clear();
 
-    reapply_package(&policy, &[], &map, &mut ops, &path, true, "com.example");
+    reapply_package(
+        &Plan::new(&policy, &[], true),
+        &map,
+        &mut ops,
+        &path,
+        "com.example",
+    );
     assert!(ops.has_call("appop:0:com.example:RUN_IN_BACKGROUND:ignore"));
     assert_eq!(journal_items(&path).len(), 1);
 }
@@ -823,10 +835,22 @@ fn standby_is_reapplied_after_the_system_rebuckets() {
 
     ops.buckets
         .insert((0, "com.example".to_string()), "40".to_string());
-    reapply_standby(&policy, &[], &mut ops, &path, false, 0, "com.example");
+    reapply_standby(
+        &Plan::new(&policy, &[], false),
+        &mut ops,
+        &path,
+        0,
+        "com.example",
+    );
     assert_eq!(ops.bucket(0, "com.example"), "40");
 
-    reapply_standby(&policy, &[], &mut ops, &path, true, 0, "com.example");
+    reapply_standby(
+        &Plan::new(&policy, &[], true),
+        &mut ops,
+        &path,
+        0,
+        "com.example",
+    );
     assert_eq!(ops.bucket(0, "com.example"), "45");
     assert_eq!(journal_items(&path).len(), 2);
 }
@@ -913,24 +937,23 @@ fn expired_deadline_leaves_the_device_untouched() {
     let map = uid_map("com.example 10123 0 /data\n");
     let mut ops = FakeOps::default();
     let policy = policy(&["com.example"], Some(layer1_all()), &[]);
-    let mut journal = Journal::load(&path).expect("journal");
-    let mut deadline = Deadline {
+    let journal = Journal::load(&path).expect("journal");
+    let deadline = Deadline {
         at: Instant::now()
             .checked_sub(Duration::from_secs(1))
             .expect("test clock supports subtraction"),
         announced: true,
     };
-    reconcile_with_deadline(
-        &policy,
-        &[],
-        &map,
-        &mut journal,
-        &mut ops,
-        true,
-        &mut deadline,
-    );
+    {
+        let mut pass = Pass {
+            journal,
+            ops: &mut ops,
+            deadline,
+        };
+        run(&Plan::new(&policy, &[], true), &map, &mut pass);
+        assert!(pass.journal.items().is_empty());
+    }
     assert!(ops.calls.is_empty());
-    assert!(journal.items().is_empty());
 }
 
 #[test]

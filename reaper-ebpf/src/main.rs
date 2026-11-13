@@ -114,7 +114,7 @@ fn try_run(ctx: &BtfTracePointContext) -> Result<(), i32> {
         uid,
         tgid,
         adj: i32::from(adj),
-        _pad: 0,
+        pad: 0,
         ts_ns: now,
     });
     entry.submit(0);

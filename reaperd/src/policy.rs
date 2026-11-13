@@ -259,6 +259,10 @@ pub fn appid_of(uid: u32) -> Option<u32> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::assert_is_empty,
+    reason = "assert! is clearer than comparing with an empty collection"
+)]
 mod tests {
     use super::*;
 

@@ -7,6 +7,9 @@ license.workspace = true
 authors.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [features]
 # aya's marker trait for map keys/values. Off by default so the crate stays
 # usable from the no_std eBPF side.

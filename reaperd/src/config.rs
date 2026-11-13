@@ -18,7 +18,7 @@ pub struct Config {
     pub btf: PathBuf,
     /// Policy file watched for reloads.
     pub policy: PathBuf,
-    /// Extra deny entries, as (appid, keep_adj).
+    /// Extra deny entries, as (appid, `keep_adj`).
     pub deny_overrides: Vec<(u32, i16)>,
     /// Restore the Layer 1 journal and exit instead of running the daemon.
     pub restore_layer1: bool,
@@ -50,7 +50,7 @@ impl Config {
                 }
                 "--btf" => cfg.btf = PathBuf::from(args.next().context("--btf needs a path")?),
                 "--policy" => {
-                    cfg.policy = PathBuf::from(args.next().context("--policy needs a path")?)
+                    cfg.policy = PathBuf::from(args.next().context("--policy needs a path")?);
                 }
                 "--deny" => {
                     let spec = args.next().context("--deny needs APPID[:KEEP_ADJ]")?;

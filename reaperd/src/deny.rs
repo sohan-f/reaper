@@ -10,6 +10,7 @@ use reaper_common::DenyCfg;
 use crate::{never_kill, policy::Policy, uidmap::UidMap};
 
 /// One appid the eBPF program nominates when its adj crosses `keep_adj`.
+#[derive(Clone, Copy)]
 pub struct DenyEntry {
     /// Appid to watch.
     pub appid: u32,
@@ -121,7 +122,7 @@ pub fn build_deny(
     entries.into_values().collect()
 }
 
-/// Returns the grace period and keep_adj for an appid, if it is denied.
+/// Returns the grace period and `keep_adj` for an appid, if it is denied.
 pub fn deny_params(deny: &[DenyEntry], appid: u32) -> Option<(u64, i16)> {
     deny.iter()
         .find(|entry| entry.appid == appid)
@@ -164,6 +165,10 @@ fn extend_never_kill(packages: &mut Vec<String>, users: &[u32]) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::assert_is_empty,
+    reason = "assert! is clearer than comparing with an empty collection"
+)]
 mod tests {
     use super::*;
     use crate::policy::DenyRule;

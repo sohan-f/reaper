@@ -18,8 +18,46 @@ log = "0.4.35"
 libc = "0.2"
 zip = "9.5.0"
 
+[workspace.lints.rust]
+# "deny" rather than "forbid": reaperd quarantines its libc calls in sys.rs and
+# reaper-common needs unsafe for the aya::Pod impls.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Flatness / size
+excessive_nesting = "warn"
+too_many_lines = "warn"
+too_many_arguments = "warn"
+cognitive_complexity = "warn"
+
+# Error handling
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+dbg_macro = "warn"
+
+# Memory
+clone_on_ref_ptr = "warn"
+large_enum_variant = "warn"
+
+# Unsafe hygiene
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+missing_safety_doc = "deny"
+
+# Pedantic lints that are too noisy for most code
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
 # reaper-ebpf is excluded from default-members: it builds only for
-# bpfel-unknown-none via `cargo xtask build-ebpf`.
+# bpfel-unknown-none via `cargo xtask build-ebpf`, and never takes these lints.
 
 [profile.release]
 opt-level = "z"

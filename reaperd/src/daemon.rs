@@ -25,7 +25,20 @@ use crate::{
     uidmap::UidMap,
 };
 
+/// One denied app and the process that decided about it.
+#[derive(Clone, Copy)]
+struct StopTarget {
+    user: u32,
+    appid: u32,
+    owner_uid: u32,
+    min_adj: i16,
+}
+
 /// State shared by the boot code and the event loop.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "flags mirror independent device markers and load outcomes"
+)]
 pub struct Daemon {
     /// Nominations waiting for their deadline.
     pub pending: Pending,
@@ -123,12 +136,14 @@ impl Daemon {
         };
         let mut ops = layer1::AndroidOps;
         layer1::reconcile(
-            &self.policy,
-            &self.builtin_never_kill,
+            &layer1::Plan::new(
+                &self.policy,
+                &self.builtin_never_kill,
+                layer1_apply_allowed(self),
+            ),
             uid_map,
             &mut ops,
             Path::new(LAYER1_JOURNAL),
-            layer1_apply_allowed(self),
         );
     }
 
@@ -150,27 +165,34 @@ impl Daemon {
                     .ok()
             })
             .collect();
-        for entry in &self.deny {
-            for &uid in &uid_dirs {
-                if uid % 100_000 != entry.appid {
-                    continue;
-                }
-                let user = uid / 100_000;
-                let adj_values = decide::adj_values_of_uid(uid);
-                if let Decision::Background { min_adj } =
-                    decide::decide(&adj_values, entry.keep_adj)
-                {
-                    let now = sys::boottime_ns();
-                    let grace_ms = self.respawn.effective_grace(uid, entry.grace_ms, now);
-                    let deadline = now.saturating_add(grace_ms.saturating_mul(1_000_000));
-                    if self.pending.insert(user, entry.appid, deadline) {
-                        inserted += 1;
-                    }
-                    info!("sweep: uid {uid} backgrounded (min adj {min_adj}); pending");
-                }
-            }
+        let entries = self.deny.clone();
+        for entry in entries {
+            inserted += self.queue_swept_uids(&uid_dirs, entry);
         }
         info!("sweep done: {inserted} pending");
+    }
+
+    fn queue_swept_uids(&mut self, uid_dirs: &[u32], entry: DenyEntry) -> u32 {
+        let mut inserted = 0u32;
+        for &uid in uid_dirs {
+            if uid % 100_000 == entry.appid && self.queue_swept(uid, &entry) {
+                inserted += 1;
+            }
+        }
+        inserted
+    }
+
+    fn queue_swept(&mut self, uid: u32, entry: &DenyEntry) -> bool {
+        let adj_values = decide::adj_values_of_uid(uid);
+        let Decision::Background { min_adj } = decide::decide(&adj_values, entry.keep_adj) else {
+            return false;
+        };
+        let now = sys::boottime_ns();
+        let grace_ms = self.respawn.effective_grace(uid, entry.grace_ms, now);
+        let deadline = now.saturating_add(grace_ms.saturating_mul(1_000_000));
+        let inserted = self.pending.insert(uid / 100_000, entry.appid, deadline);
+        info!("sweep: uid {uid} backgrounded (min adj {min_adj}); pending");
+        inserted
     }
 
     /// Re-checks a pending (user, appid) and enforces when it is backgrounded.
@@ -211,61 +233,64 @@ impl Daemon {
                 info!("uid {owner_uid}: keep (foreground/visible, min adj {min_adj})");
             }
             Decision::Background { min_adj } => {
-                self.stop_background(user, appid, owner_uid, min_adj, grace_ms);
+                self.stop_background(
+                    StopTarget {
+                        user,
+                        appid,
+                        owner_uid,
+                        min_adj,
+                    },
+                    grace_ms,
+                );
             }
         }
     }
 
-    fn stop_background(
-        &mut self,
-        user: u32,
-        appid: u32,
-        owner_uid: u32,
-        min_adj: i16,
-        grace_ms: u64,
-    ) {
+    fn stop_background(&mut self, target: StopTarget, grace_ms: u64) {
         let now = sys::boottime_ns();
         if layer1_apply_allowed(self) {
             let mut ops = layer1::AndroidOps;
-            for package in self.uid_map.packages_of(appid) {
+            let plan = layer1::Plan::new(&self.policy, &self.builtin_never_kill, true);
+            for package in self.uid_map.packages_of(target.appid) {
                 layer1::reapply_standby(
-                    &self.policy,
-                    &self.builtin_never_kill,
+                    &plan,
                     &mut ops,
                     Path::new(LAYER1_JOURNAL),
-                    true,
-                    user,
+                    target.user,
                     package,
                 );
             }
         }
         if self.policy.mode == Mode::Observe || self.budget.tripped() {
-            self.log_would_stop(user, appid, owner_uid, min_adj);
+            self.log_would_stop(target);
             return;
         }
-        let packages: Vec<String> = self.uid_map.packages_of(appid).to_vec();
+        let packages: Vec<String> = self.uid_map.packages_of(target.appid).to_vec();
         if packages.is_empty() {
-            warn!("uid {owner_uid}: backgrounded but no package name; cannot force-stop");
+            warn!(
+                "uid {}: backgrounded but no package name; cannot force-stop",
+                target.owner_uid
+            );
             return;
         }
         if !self.budget.allow_kill(now) {
             self.trip_budget();
             return;
         }
-        if self.respawn.tripped(owner_uid, now) {
-            self.back_off(owner_uid, grace_ms, now, &packages);
+        if self.respawn.tripped(target.owner_uid, now) {
+            self.back_off(target, grace_ms, now, &packages);
         }
-        if self.stop_packages(user, owner_uid, appid, &packages) {
+        if Self::stop_packages(target, &packages) {
             self.stops += 1;
             self.budget.record_kill(now);
-            self.respawn.record_kill(owner_uid, now);
+            self.respawn.record_kill(target.owner_uid, now);
         }
     }
 
-    fn log_would_stop(&mut self, user: u32, appid: u32, owner_uid: u32, min_adj: i16) {
+    fn log_would_stop(&mut self, target: StopTarget) {
         let packages: Vec<&str> = self
             .uid_map
-            .packages_of(appid)
+            .packages_of(target.appid)
             .iter()
             .map(String::as_str)
             .collect();
@@ -275,52 +300,61 @@ impl Daemon {
             "observe"
         };
         info!(
-            "{mode}: would force-stop user {user} uid {owner_uid} appid {appid} min_adj {min_adj} packages [{}]",
+            "{mode}: would force-stop user {} uid {} appid {} min_adj {} packages [{}]",
+            target.user,
+            target.owner_uid,
+            target.appid,
+            target.min_adj,
             packages.join(",")
         );
         self.would_stop += 1;
     }
 
-    fn back_off(&mut self, owner_uid: u32, grace_ms: u64, now: u64, packages: &[String]) {
-        self.respawn.back_off(owner_uid, now);
-        let backoff_grace = self.respawn.effective_grace(owner_uid, grace_ms, now);
+    fn back_off(&mut self, target: StopTarget, grace_ms: u64, now: u64, packages: &[String]) {
+        self.respawn.back_off(target.owner_uid, now);
+        let backoff_grace = self
+            .respawn
+            .effective_grace(target.owner_uid, grace_ms, now);
         warn!(
-            "respawn guard: uid {owner_uid} hit {} kills in {} s; backing off to {backoff_grace} ms grace",
-            self.policy.respawn_max, self.policy.respawn_window_s
+            "respawn guard: uid {} hit {} kills in {} s; backing off to {backoff_grace} ms grace",
+            target.owner_uid, self.policy.respawn_max, self.policy.respawn_window_s
         );
         if !layer1_apply_allowed(self) {
             return;
         }
         let mut ops = layer1::AndroidOps;
+        let plan = layer1::Plan::new(&self.policy, &self.builtin_never_kill, true);
         for package in packages {
             layer1::reapply_package(
-                &self.policy,
-                &self.builtin_never_kill,
+                &plan,
                 &self.uid_map,
                 &mut ops,
                 Path::new(LAYER1_JOURNAL),
-                true,
                 package,
             );
         }
     }
 
-    fn stop_packages(&self, user: u32, owner_uid: u32, appid: u32, packages: &[String]) -> bool {
+    fn stop_packages(target: StopTarget, packages: &[String]) -> bool {
         let mut stopped = false;
         for package in packages {
             if let Some(reason) = stop_reason() {
                 info!("stopping force-stop loop: {reason}");
                 break;
             }
-            match enforce::force_stop(user, package) {
+            match enforce::force_stop(target.user, package) {
                 Ok(()) => {
                     info!(
-                        "force-stopped user {user} uid {owner_uid} appid {appid} package {package}"
+                        "force-stopped user {} uid {} appid {} package {package}",
+                        target.user, target.owner_uid, target.appid
                     );
                     stopped = true;
                 }
                 Err(err) => {
-                    error!("force-stop user {user} package {package} failed: {err:#}");
+                    error!(
+                        "force-stop user {} package {package} failed: {err:#}",
+                        target.user
+                    );
                 }
             }
         }

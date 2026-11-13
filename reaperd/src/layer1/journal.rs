@@ -176,6 +176,10 @@ fn write_atomic(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::assert_is_empty,
+    reason = "assert! is clearer than comparing with an empty collection"
+)]
 mod tests {
     use super::*;
 

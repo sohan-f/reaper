@@ -38,6 +38,44 @@ const ACTIONS: [&str; 4] = [
 // timeout by the number of packages and freezes event handling.
 const RECONCILE_BUDGET: Duration = Duration::from_secs(10);
 
+/// What one pass should do: the policy, the built-in safety list, and whether
+/// mutating the device is allowed.
+#[derive(Clone, Copy)]
+pub struct Plan<'a> {
+    policy: &'a Policy,
+    builtin: &'a [String],
+    apply: bool,
+}
+
+impl<'a> Plan<'a> {
+    /// Bundles the inputs that decide what Layer 1 suppresses.
+    pub fn new(policy: &'a Policy, builtin: &'a [String], apply: bool) -> Self {
+        Self {
+            policy,
+            builtin,
+            apply,
+        }
+    }
+
+    fn is_never_kill(&self, package: &str) -> bool {
+        self.policy.never_kill.iter().any(|p| p == package)
+            || self.builtin.iter().any(|p| p == package)
+    }
+
+    fn denied(&self) -> HashSet<&'a str> {
+        self.policy
+            .deny
+            .iter()
+            .filter(|rule| !self.is_never_kill(&rule.package))
+            .map(|rule| rule.package.as_str())
+            .collect()
+    }
+
+    fn denies(&self, package: &str) -> bool {
+        !self.is_never_kill(package) && self.policy.deny.iter().any(|rule| rule.package == package)
+    }
+}
+
 struct Deadline {
     at: Instant,
     announced: bool,
@@ -63,19 +101,49 @@ impl Deadline {
     }
 }
 
-fn is_never_kill(policy: &Policy, builtin: &[String], package: &str) -> bool {
-    policy.never_kill.iter().any(|p| p == package) || builtin.iter().any(|p| p == package)
+/// State shared by one pass: the journal, the device commands, and the budget.
+pub(super) struct Pass<'a> {
+    journal: Journal,
+    ops: &'a mut dyn Ops,
+    deadline: Deadline,
 }
 
-pub fn desired_instances(
-    policy: &Policy,
-    builtin: &[String],
-    uid_map: &UidMap,
-) -> Vec<(u32, String)> {
+impl<'a> Pass<'a> {
+    fn load(ops: &'a mut dyn Ops, journal_path: &Path) -> anyhow::Result<Self> {
+        Ok(Self {
+            journal: Journal::load(journal_path)?,
+            ops,
+            deadline: Deadline::new(),
+        })
+    }
+
+    fn expired(&mut self) -> bool {
+        self.deadline.expired()
+    }
+
+    fn save_or_log(&self, action: &str) {
+        if let Err(err) = self.journal.save() {
+            error!("Layer 1: failed to {action}: {err:#}");
+        }
+    }
+}
+
+fn load_pass<'a>(ops: &'a mut dyn Ops, journal_path: &Path) -> Option<Pass<'a>> {
+    match Pass::load(ops, journal_path) {
+        Ok(pass) => Some(pass),
+        Err(err) => {
+            error!("Layer 1 disabled: cannot read journal: {err:#}");
+            None
+        }
+    }
+}
+
+/// The `(user, package)` pairs the current policy denies.
+pub fn desired_instances(plan: &Plan<'_>, uid_map: &UidMap) -> Vec<(u32, String)> {
     let mut seen = HashSet::new();
     let mut instances = Vec::new();
-    for rule in &policy.deny {
-        if is_never_kill(policy, builtin, &rule.package) {
+    for rule in &plan.policy.deny {
+        if plan.is_never_kill(&rule.package) {
             continue;
         }
         for instance in uid_map.instances_of(&rule.package) {
@@ -91,113 +159,66 @@ pub fn desired_instances(
 ///
 /// `uid_map` is `None` when the package map could not be trusted. In that case
 /// reconciliation is skipped: an empty map would look like every package was
-/// uninstalled. `apply` is false in observe mode, while disarmed, while the kill
-/// budget is tripped, or while a kill-switch marker is present; restore still runs.
+/// uninstalled. The plan's `apply` flag is false in observe mode, while
+/// disarmed, while the kill budget is tripped, or while a kill-switch marker is
+/// present; restore still runs.
 pub fn reconcile(
-    policy: &Policy,
-    builtin: &[String],
+    plan: &Plan<'_>,
     uid_map: Option<&UidMap>,
     ops: &mut dyn Ops,
     journal_path: &Path,
-    apply: bool,
 ) {
     let Some(uid_map) = uid_map else {
         warn!("Layer 1 skipped: package map is unavailable");
         return;
     };
-    let mut journal = match Journal::load(journal_path) {
-        Ok(journal) => journal,
-        Err(err) => {
-            error!("Layer 1 disabled: cannot read journal: {err:#}");
-            return;
-        }
+    let Some(mut pass) = load_pass(ops, journal_path) else {
+        return;
     };
-
-    reconcile_with_deadline(
-        policy,
-        builtin,
-        uid_map,
-        &mut journal,
-        ops,
-        apply,
-        &mut Deadline::new(),
-    );
+    run(plan, uid_map, &mut pass);
 }
 
-fn reconcile_with_deadline(
-    policy: &Policy,
-    builtin: &[String],
-    uid_map: &UidMap,
-    journal: &mut Journal,
-    ops: &mut dyn Ops,
-    apply: bool,
-    deadline: &mut Deadline,
-) {
-    let denied: HashSet<&str> = policy
-        .deny
-        .iter()
-        .filter(|rule| !is_never_kill(policy, builtin, &rule.package))
-        .map(|rule| rule.package.as_str())
-        .collect();
+fn run(plan: &Plan<'_>, uid_map: &UidMap, pass: &mut Pass<'_>) {
+    let denied = plan.denied();
+    restore_removed(&denied, uid_map, pass);
+    restore_disabled_categories(plan.policy.layer1.as_ref(), pass);
 
-    restore_removed(journal, &denied, uid_map, ops, deadline);
-    restore_disabled_categories(journal, policy.layer1.as_ref(), ops, deadline);
-
-    if !apply {
+    if !plan.apply {
         return;
     }
-    let Some(layer1) = policy.layer1.as_ref() else {
+    let Some(layer1) = plan.policy.layer1.as_ref() else {
         return;
     };
-    for (user, package) in desired_instances(policy, builtin, uid_map) {
-        if deadline.expired() {
+    for (user, package) in desired_instances(plan, uid_map) {
+        if pass.expired() {
             return;
         }
-        apply_instance(layer1, user, &package, journal, ops, deadline);
+        apply_instance(layer1, user, &package, pass);
     }
 }
 
 /// Reapplies the enabled Layer 1 categories for one denied package.
 pub fn reapply_package(
-    policy: &Policy,
-    builtin: &[String],
+    plan: &Plan<'_>,
     uid_map: &UidMap,
     ops: &mut dyn Ops,
     journal_path: &Path,
-    apply: bool,
     package: &str,
 ) {
-    if !apply {
+    if !plan.apply || !plan.denies(package) {
         return;
     }
-    let Some(layer1) = policy.layer1.as_ref() else {
+    let Some(layer1) = plan.policy.layer1.as_ref() else {
         return;
     };
-    if is_never_kill(policy, builtin, package)
-        || !policy.deny.iter().any(|rule| rule.package == package)
-    {
+    let Some(mut pass) = load_pass(ops, journal_path) else {
         return;
-    }
-    let mut journal = match Journal::load(journal_path) {
-        Ok(journal) => journal,
-        Err(err) => {
-            error!("Layer 1 disabled: cannot read journal: {err:#}");
-            return;
-        }
     };
-    let mut deadline = Deadline::new();
     for instance in uid_map.instances_of(package) {
-        if deadline.expired() {
+        if pass.expired() {
             return;
         }
-        apply_instance(
-            layer1,
-            instance.user,
-            package,
-            &mut journal,
-            ops,
-            &mut deadline,
-        );
+        apply_instance(layer1, instance.user, package, &mut pass);
     }
 }
 
@@ -207,44 +228,27 @@ pub fn reapply_package(
 /// drifts back within seconds. Call this when the app drops to the background,
 /// which is the event the bucket is meant to suppress.
 pub fn reapply_standby(
-    policy: &Policy,
-    builtin: &[String],
+    plan: &Plan<'_>,
     ops: &mut dyn Ops,
     journal_path: &Path,
-    apply: bool,
     user: u32,
     package: &str,
 ) {
-    if !apply {
+    if !plan.apply || !plan.denies(package) {
         return;
     }
-    let Some(bucket) = policy
+    let Some(bucket) = plan
+        .policy
         .layer1
         .as_ref()
-        .and_then(|layer1| layer1.standby_bucket.as_ref())
+        .and_then(|layer1| layer1.standby_bucket.as_deref())
     else {
         return;
     };
-    if is_never_kill(policy, builtin, package)
-        || !policy.deny.iter().any(|rule| rule.package == package)
-    {
+    let Some(mut pass) = load_pass(ops, journal_path) else {
         return;
-    }
-    let mut journal = match Journal::load(journal_path) {
-        Ok(journal) => journal,
-        Err(err) => {
-            error!("Layer 1 disabled: cannot read journal: {err:#}");
-            return;
-        }
     };
-    apply_standby(
-        user,
-        package,
-        bucket,
-        &mut journal,
-        ops,
-        &mut Deadline::new(),
-    );
+    apply_standby(user, package, bucket, &mut pass);
 }
 
 /// Restores every journaled Layer 1 mutation.
@@ -254,11 +258,11 @@ pub fn reapply_standby(
 /// Returns an error if the journal cannot be read or any restore command fails.
 /// Failed items stay in the journal so a later run can retry.
 pub fn restore_all(journal_path: &Path, ops: &mut dyn Ops) -> anyhow::Result<()> {
-    let mut journal = Journal::load(journal_path)?;
-    let items: Vec<Item> = journal.items().to_vec();
+    let mut pass = Pass::load(ops, journal_path)?;
+    let items: Vec<Item> = pass.journal.items().to_vec();
     let mut failures = 0;
     for item in &items {
-        if !restore_item(&mut journal, ops, item) {
+        if !restore_item(item, &mut pass) {
             failures += 1;
         }
     }
@@ -269,11 +273,9 @@ pub fn restore_all(journal_path: &Path, ops: &mut dyn Ops) -> anyhow::Result<()>
     Ok(())
 }
 
-fn save_or_log(journal: &Journal, action: &str) {
-    if let Err(err) = journal.save() {
-        error!("Layer 1: failed to {action}: {err:#}");
-    }
-}
-
 #[cfg(test)]
+#[allow(
+    clippy::assert_is_empty,
+    reason = "assert! is clearer than comparing with an empty collection"
+)]
 mod tests;

@@ -15,7 +15,7 @@ pub struct Event {
     /// `oom_score_adj` of the target task at the time of the write.
     pub adj: i32,
     /// Explicit padding so the layout matches on both sides.
-    pub _pad: u32,
+    pub pad: u32,
     /// Kernel timestamp from `bpf_ktime_get_ns`, nanoseconds since boot.
     pub ts_ns: u64,
 }
@@ -30,10 +30,18 @@ pub struct DenyCfg {
     pub flags: u16,
 }
 
+#[cfg(feature = "pod")]
+#[allow(
+    unsafe_code,
+    reason = "aya::Pod is an unsafe marker trait; layout is repr(C)"
+)]
 // SAFETY: repr(C), every byte is initialized by writers, and any bit pattern is
 // valid, so it may be copied to and from byte slices.
-#[cfg(feature = "pod")]
 unsafe impl aya::Pod for Event {}
-// SAFETY: same layout guarantees as `Event`.
 #[cfg(feature = "pod")]
+#[allow(
+    unsafe_code,
+    reason = "aya::Pod is an unsafe marker trait; layout is repr(C)"
+)]
+// SAFETY: same layout guarantees as `Event`.
 unsafe impl aya::Pod for DenyCfg {}
