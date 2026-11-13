@@ -12,6 +12,7 @@ mod command;
 mod config;
 mod daemon;
 mod decide;
+mod deny;
 mod enforce;
 mod layer1;
 mod never_kill;
@@ -33,7 +34,8 @@ use log::{error, info, warn};
 use reaper_common::Event;
 
 use crate::config::Config;
-use crate::daemon::{Daemon, DenyMapMut, deny_params};
+use crate::daemon::Daemon;
+use crate::deny::{DenyMapMut, deny_params};
 use crate::paths::{ARMED_FILE, LAYER1_JOURNAL, PACKAGES_LIST, REAPER_DIR};
 use crate::uidmap::UidMap;
 
@@ -234,7 +236,7 @@ fn run() -> anyhow::Result<()> {
                                 let user = ev.uid / 100_000;
                                 let appid = ev.uid % 100_000;
                                 let now = sys::boottime_ns();
-                                let Some((grace_ms, _)) = deny_params(&daemon, appid) else {
+                                let Some((grace_ms, _)) = deny_params(&daemon.deny, appid) else {
                                     info!(
                                         "dropping nomination for user {user} appid {appid}: no longer denied"
                                     );
