@@ -33,15 +33,13 @@ impl UidMap {
     pub fn packages_of(&self, appid: u32) -> &[String] {
         self.packages_by_appid
             .get(&appid)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+            .map_or(&[], Vec::as_slice)
     }
 
     pub fn instances_of(&self, package: &str) -> &[PackageInstance] {
         self.instances_by_package
             .get(package)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+            .map_or(&[], Vec::as_slice)
     }
 
     pub fn uid_of(&self, package: &str) -> Option<u32> {
@@ -194,7 +192,7 @@ mod tests {
                 },
                 PackageInstance {
                     user: 10,
-                    uid: 1010123,
+                    uid: 1_010_123,
                     appid: 10123,
                 },
             ]

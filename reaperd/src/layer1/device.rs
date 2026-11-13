@@ -434,12 +434,12 @@ Packages:
         );
         assert_eq!(user0.get(&component_key("com.example/.Missing")), None);
 
-        let user10 = parse_component_states(text, 10, "com.example");
+        let profile_10 = parse_component_states(text, 10, "com.example");
         assert_eq!(
-            user10.get(&component_key("com.example/.Other")),
+            profile_10.get(&component_key("com.example/.Other")),
             Some(&ComponentState::Disabled)
         );
-        assert_eq!(user10.get(&component_key("com.example/.Boot")), None);
+        assert_eq!(profile_10.get(&component_key("com.example/.Boot")), None);
     }
 
     #[test]

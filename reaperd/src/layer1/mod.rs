@@ -1613,7 +1613,9 @@ mod tests {
         let policy = policy(&["com.example"], Some(layer1_all()), &[]);
         let mut journal = Journal::load(&path).expect("journal");
         let mut deadline = Deadline {
-            at: Instant::now() - Duration::from_secs(1),
+            at: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("test clock supports subtraction"),
             announced: true,
         };
         reconcile_with_deadline(
