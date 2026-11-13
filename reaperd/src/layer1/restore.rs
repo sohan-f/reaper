@@ -10,6 +10,7 @@ use super::journal::{Item, Kind};
 use crate::policy::Layer1Policy;
 use crate::uidmap::UidMap;
 
+/// Restores items whose package was removed from the deny set or uninstalled.
 pub(super) fn restore_removed(denied: &HashSet<&str>, uid_map: &UidMap, pass: &mut Pass<'_>) {
     let packages: HashSet<String> = pass
         .journal
@@ -54,6 +55,7 @@ fn drop_absent(pass: &mut Pass<'_>, package: &str, is_denied: bool) {
     }
 }
 
+/// Restores items whose Layer 1 category is no longer enabled.
 pub(super) fn restore_disabled_categories(layer1: Option<&Layer1Policy>, pass: &mut Pass<'_>) {
     let stale: Vec<Item> =
         pass.journal
@@ -75,6 +77,9 @@ pub(super) fn restore_disabled_categories(layer1: Option<&Layer1Policy>, pass: &
     }
 }
 
+/// Restores one journaled item, dropping it on success.
+///
+/// Returns `false` when the item stays in the journal for a later retry.
 pub(super) fn restore_item(item: &Item, pass: &mut Pass<'_>) -> bool {
     let Some(result) = restore_one(pass, item) else {
         return false;

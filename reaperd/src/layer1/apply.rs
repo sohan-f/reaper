@@ -16,6 +16,7 @@ struct StandbySetting<'a> {
     id: String,
 }
 
+/// Applies every enabled category to one `(user, package)` instance.
 pub(super) fn apply_instance(layer1: &Layer1Policy, user: u32, package: &str, pass: &mut Pass<'_>) {
     if layer1.disable_boot_receivers {
         apply_receivers(user, package, pass);
@@ -279,6 +280,7 @@ fn journal_and_set_appop(
     }
 }
 
+/// Applies the configured standby bucket to one `(user, package)` instance.
 pub(super) fn apply_standby(user: u32, package: &str, bucket: &str, pass: &mut Pass<'_>) {
     if pass.expired() {
         return;
