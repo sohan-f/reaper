@@ -54,7 +54,8 @@ impl KillBudget {
             }
             self.kills.pop_front();
         }
-        if self.kills.len() as u32 >= self.limit {
+        let kills = u32::try_from(self.kills.len()).unwrap_or(u32::MAX);
+        if kills >= self.limit {
             self.tripped = true;
             return false;
         }
@@ -113,7 +114,8 @@ impl RespawnGuard {
             }
             kills.pop_front();
         }
-        kills.len() as u32 >= self.max
+        let kills = u32::try_from(kills.len()).unwrap_or(u32::MAX);
+        kills >= self.max
     }
 
     /// Raises the uid's backoff level for one more window.

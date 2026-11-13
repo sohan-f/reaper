@@ -183,7 +183,8 @@ impl<'a> Btf<'a> {
                 continue;
             }
             if self.type_name(off)? == name {
-                return Ok(i as u32 + 1);
+                let id = u32::try_from(i + 1).context("vmlinux BTF has too many types")?;
+                return Ok(id);
             }
         }
         bail!("struct {name} not found in vmlinux BTF")
@@ -302,6 +303,9 @@ fn le_u32(data: &[u8], off: usize) -> anyhow::Result<u32> {
 
 #[cfg(test)]
 mod tests {
+    // Synthetic buffers are tiny; every length fits in the target integer.
+    #![allow(clippy::cast_possible_truncation)]
+
     use super::*;
     use std::collections::HashMap;
 
