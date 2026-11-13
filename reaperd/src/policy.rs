@@ -5,49 +5,75 @@ use std::path::Path;
 use anyhow::{Context, bail, ensure};
 use serde::Deserialize;
 
+/// First appid Android assigns to installed apps.
 pub const APPID_START: u32 = 10_000;
+/// Last appid Android assigns to installed apps.
 pub const APPID_END: u32 = 19_999;
 /// Upper bound on the effective grace, including backoff.
 pub const MAX_GRACE_MS: u64 = 300_000;
 const DEFAULT_GRACE_MS: u64 = 2_000;
 const DEFAULT_KEEP_ADJ: i16 = 100;
 
+/// Whether decisions are only logged or actually enforced.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
+    /// Log what would happen and never mutate the device.
     Observe,
+    /// Force-stop denied apps once the decision survives the grace period.
     Enforce,
 }
 
+/// One `[[deny]]` entry, with the global defaults already applied.
 #[derive(Clone, Debug)]
 pub struct DenyRule {
+    /// Package name the rule targets.
     pub package: String,
+    /// Grace period between nomination and the decision.
     pub grace_ms: u64,
+    /// Nominate only above this `oom_score_adj`.
     pub keep_adj: i16,
 }
 
+/// One `OP:MODE` entry from `[layer1] appops`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppOpSetting {
+    /// App-op name, validated against the supported list at parse time.
     pub op: String,
+    /// Mode to set the op to.
     pub mode: String,
 }
 
+/// The `[layer1]` table: device mutations that are reversed when denied.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Layer1Policy {
+    /// Disable boot receivers of denied packages.
     pub disable_boot_receivers: bool,
+    /// App ops to set for denied packages.
     pub appops: Vec<AppOpSetting>,
+    /// Standby bucket to pin denied packages to.
     pub standby_bucket: Option<String>,
 }
 
+/// The effective policy: `[global]` defaults plus every `[[deny]]` rule.
 #[derive(Clone, Debug)]
 pub struct Policy {
+    /// Whether decisions are enforced.
     pub mode: Mode,
+    /// Default grace period for rules that do not set their own.
     pub grace_ms: u64,
+    /// Default `keep_adj` for rules that do not set their own.
     pub keep_adj: i16,
+    /// Force-stops allowed per minute before switching to observe.
     pub kill_budget_per_min: u32,
+    /// Window the respawn guard counts kills in.
     pub respawn_window_s: u64,
+    /// Kills of one uid inside the window before it backs off.
     pub respawn_max: u32,
+    /// Packages that must never be nominated.
     pub never_kill: Vec<String>,
+    /// Denied packages, in file order.
     pub deny: Vec<DenyRule>,
+    /// Reversible device mutations, absent when `[layer1]` is missing.
     pub layer1: Option<Layer1Policy>,
 }
 
@@ -156,12 +182,23 @@ fn valid_appid(uid: u32) -> bool {
 }
 
 impl Policy {
+    /// Reads and parses the policy file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or fails validation.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         Self::parse(&text)
     }
 
+    /// Parses a policy document and applies the global defaults to each rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on unknown keys, out-of-range values, or an app-op that
+    /// this build does not support.
     pub fn parse(text: &str) -> anyhow::Result<Self> {
         let raw: RawPolicy = toml::from_str(text).context("failed to parse policy TOML")?;
 
