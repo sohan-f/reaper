@@ -9,6 +9,7 @@
 
 mod btf;
 mod command;
+mod config;
 mod decide;
 mod enforce;
 mod layer1;
@@ -36,15 +37,13 @@ use aya::{
 use log::{error, info, warn};
 use reaper_common::{DenyCfg, Event};
 
+use crate::config::Config;
 use crate::decide::Decision;
 use crate::enforce::{KillBudget, RespawnGuard};
 use crate::pending::Pending;
 use crate::policy::{Mode, Policy};
 use crate::uidmap::UidMap;
 
-const DEFAULT_BPF_OBJECT: &str = "/data/adb/modules/ksu-reaper/bin/reaper-ebpf.o";
-const DEFAULT_BTF: &str = "/sys/kernel/btf/vmlinux";
-const DEFAULT_POLICY: &str = "/data/adb/reaper/policy.toml";
 const PACKAGES_LIST: &str = "/data/system/packages.list";
 const REAPER_DIR: &str = "/data/adb/reaper";
 const ARMED_FILE: &str = "/data/adb/reaper/armed";
@@ -52,14 +51,6 @@ const DISABLE_FILE: &str = "/data/adb/reaper/disable";
 const PANIC_FILE: &str = "/data/adb/reaper/panic";
 const BUDGET_FILE: &str = "/data/adb/reaper/budget-exceeded";
 const LAYER1_JOURNAL: &str = "/data/adb/reaper/layer1-journal.toml";
-
-struct Config {
-    bpf_object: PathBuf,
-    btf: PathBuf,
-    policy: PathBuf,
-    deny_overrides: Vec<(u32, i16)>,
-    restore_layer1: bool,
-}
 
 struct DenyEntry {
     appid: u32,
@@ -88,75 +79,6 @@ struct Daemon {
 }
 
 type DenyMapMut<'a> = BpfHashMap<&'a mut aya::maps::MapData, u32, DenyCfg>;
-
-fn print_usage() {
-    eprintln!(
-        "usage: reaperd [--bpf-object PATH] [--btf PATH] [--policy PATH] [--deny APPID[:KEEP_ADJ]]... [--restore-layer1]
-  --bpf-object PATH  eBPF object to load (default: {DEFAULT_BPF_OBJECT}, env REAPER_BPF_OBJECT)
-  --btf PATH         vmlinux BTF (default: {DEFAULT_BTF})
-  --policy PATH      policy file (default: {DEFAULT_POLICY})
-  --deny APPID[:KEEP_ADJ]
-                     additional deny entries; appid must be 10000..=19999
-  --restore-layer1   restore journaled Layer 1 state and exit; needs no policy or kernel"
-    );
-}
-
-fn parse_args() -> anyhow::Result<Config> {
-    let mut cfg = Config {
-        bpf_object: std::env::var_os("REAPER_BPF_OBJECT")
-            .map_or_else(|| PathBuf::from(DEFAULT_BPF_OBJECT), PathBuf::from),
-        btf: PathBuf::from(DEFAULT_BTF),
-        policy: PathBuf::from(DEFAULT_POLICY),
-        deny_overrides: Vec::new(),
-        restore_layer1: false,
-    };
-
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--bpf-object" => {
-                cfg.bpf_object = PathBuf::from(args.next().context("--bpf-object needs a path")?);
-            }
-            "--btf" => cfg.btf = PathBuf::from(args.next().context("--btf needs a path")?),
-            "--policy" => cfg.policy = PathBuf::from(args.next().context("--policy needs a path")?),
-            "--deny" => {
-                let spec = args.next().context("--deny needs APPID[:KEEP_ADJ]")?;
-                cfg.deny_overrides.push(parse_deny(&spec)?);
-            }
-            "--restore-layer1" => cfg.restore_layer1 = true,
-            "-h" | "--help" => {
-                print_usage();
-                process::exit(0);
-            }
-            other => bail!("unknown argument {other:?} (see --help)"),
-        }
-    }
-    Ok(cfg)
-}
-
-fn parse_deny(spec: &str) -> anyhow::Result<(u32, i16)> {
-    let (appid, keep_adj) = match spec.split_once(':') {
-        Some((a, k)) => (
-            a.parse()
-                .with_context(|| format!("invalid appid in {spec:?}"))?,
-            k.parse()
-                .with_context(|| format!("invalid keep_adj in {spec:?}"))?,
-        ),
-        None => (
-            spec.parse()
-                .with_context(|| format!("invalid appid in {spec:?}"))?,
-            100,
-        ),
-    };
-    if !(crate::policy::APPID_START..=crate::policy::APPID_END).contains(&appid) {
-        bail!(
-            "appid {appid} outside {}..={}",
-            crate::policy::APPID_START,
-            crate::policy::APPID_END
-        );
-    }
-    Ok((appid, keep_adj))
-}
 
 fn init_logging() {
     let level = std::env::var("REAPER_LOG")
@@ -640,7 +562,7 @@ fn reload_policy(daemon: &mut Daemon, deny_map: &mut DenyMapMut<'_>) -> anyhow::
 }
 
 fn run() -> anyhow::Result<()> {
-    let cfg = parse_args()?;
+    let cfg = Config::parse()?;
     if cfg.restore_layer1 {
         let mut ops = layer1::AndroidOps;
         layer1::restore_all(Path::new(LAYER1_JOURNAL), &mut ops)
